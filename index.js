@@ -54,11 +54,21 @@ const CRON_TIMEZONE = 'Asia/Karachi';
 // Message templates
 // ----------------------------------------------------------------------------
 
-function buildOpeningMessage() {
+function buildMorningOpeningMessage() {
   return (
     `||<@&${RAID_ROLE_ID}>||\n` +
     `I'm Back Fams <a:alya:1494783730122752142>\n` +
     `The morning raid session is officially open. You have 30 minutes to submit your links in the channel. Any links posted after the deadline will not be considered <a:alya:1494775877622435983>\n` +
+    `If your links getting removed, kindly remove your tracking ID and try again <a:alya:1494782724022603827>\n` +
+    `Wishing everyone happy engagement and great interactions <a:alya:1494940138860711936>`
+  );
+}
+
+function buildEveningOpeningMessage() {
+  return (
+    `||<@&${RAID_ROLE_ID}>||\n` +
+    `I'm Back Fams <a:alya:1494783730122752142>\n` +
+    `The evening raid session is officially open. You have 30 minutes to submit your links in the channel. Any links posted after the deadline will not be considered <a:alya:1494775877622435983>\n` +
     `If your links getting removed, kindly remove your tracking ID and try again <a:alya:1494782724022603827>\n` +
     `Wishing everyone happy engagement and great interactions <a:alya:1494940138860711936>`
   );
@@ -183,7 +193,7 @@ async function setRolePermissions(channel, { view, send }) {
 // Core workflow
 // ----------------------------------------------------------------------------
 
-async function openRaidSession(channelId, sessionLabel) {
+async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
   try {
     const channel = await client.channels.fetch(channelId);
     if (!channel || !channel.isTextBased()) {
@@ -195,7 +205,7 @@ async function openRaidSession(channelId, sessionLabel) {
     await setRolePermissions(channel, { view: true, send: true });
 
     const sentMessage = await channel.send({
-      content: buildOpeningMessage(),
+      content: buildOpeningMessageFn(),
       allowedMentions: { roles: [RAID_ROLE_ID] },
     });
 
@@ -250,7 +260,7 @@ function scheduleRaidSessions() {
     SESSION_1_CRON,
     () => {
       console.log('[cron] Triggering Session 1 (11:00 AM Asia/Karachi) — Morning channel.');
-      openRaidSession(MORNING_CHANNEL_ID, 'Morning');
+      openRaidSession(MORNING_CHANNEL_ID, 'Morning', buildMorningOpeningMessage);
     },
     { timezone: CRON_TIMEZONE }
   );
@@ -259,7 +269,7 @@ function scheduleRaidSessions() {
     SESSION_2_CRON,
     () => {
       console.log('[cron] Triggering Session 2 (6:00 PM Asia/Karachi) — Evening channel.');
-      openRaidSession(EVENING_CHANNEL_ID, 'Evening');
+      openRaidSession(EVENING_CHANNEL_ID, 'Evening', buildEveningOpeningMessage);
     },
     { timezone: CRON_TIMEZONE }
   );
@@ -288,6 +298,27 @@ if (!DISCORD_TOKEN) {
   console.error('[bot] DISCORD_TOKEN is not set in your .env file. Cannot start the bot.');
   process.exit(1);
 }
+
+// ----------------------------------------------------------------------------
+// Keep-alive HTTP server
+// ----------------------------------------------------------------------------
+// Render (and similar hosts) expect a web service to have an open port and
+// will spin it down / time it out otherwise. This tiny server just answers
+// every request with a plain "Bot is running!" so the host sees activity;
+// it has nothing to do with the Discord bot's actual logic above.
+
+const http = require('http');
+
+const PORT = process.env.PORT || 3000;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running!');
+  })
+  .listen(PORT, () => {
+    console.log(`[http] Keep-alive server running on port ${PORT}`);
+  });
 
 client.login(DISCORD_TOKEN).catch((err) => {
   console.error('[bot] Failed to log in. Check that DISCORD_TOKEN is correct.', err);
