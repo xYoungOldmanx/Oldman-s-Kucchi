@@ -78,9 +78,9 @@ function buildClosingMessage(linkCount) {
   const withinWindow = linkCount > LINK_COUNT_THRESHOLD ? '2 Hours' : '1 Hour';
 
   return (
-    `Alright, Fams, that’s a wrap :alya~37: \n` +
-    `The Raid Session Is Now Closed :alya~23: \n` +
-    `**Complete Your Engagements Within ${withinWindow}** :alya~38: \n` +
+    `Alright, Fams, that’s a wrap <a:alya:1494775877622435983> \n` +
+    `The Raid Session Is Now Closed <a:alya:1494782724022603827> \n` +
+    `**Complete Your Engagements Within ${withinWindow}** <a:alya:1494940138860711936> \n` +
     `If someone didn’t complete engagement please report it in https://discord.com/channels/1343701000174698602/1414278885260005496`
   );
 }
