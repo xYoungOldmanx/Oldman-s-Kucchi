@@ -663,6 +663,9 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
+console.log('[bot] Token found. Length:', DISCORD_TOKEN.length);
+console.log('[bot] Attempting login...');
+
 // ----------------------------------------------------------------------------
 // Keep-alive HTTP server (for Render)
 // ----------------------------------------------------------------------------
