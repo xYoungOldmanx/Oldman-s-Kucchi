@@ -681,7 +681,10 @@ http
     console.log(`[http] Keep-alive server running on port ${PORT}`);
   });
 
-client.login(DISCORD_TOKEN).catch((err) => {
-  console.error('[bot] Failed to log in. Check that DISCORD_TOKEN is correct.', err);
-  process.exit(1);
-});
+client.login(DISCORD_TOKEN)
+  .then(() => console.log('[bot] Login succeeded!'))
+  .catch((err) => {
+    console.error('[bot] LOGIN FAILED:', err.message);
+    console.error('[bot] Error code:', err.code);
+    process.exit(1);
+  });
