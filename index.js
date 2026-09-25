@@ -607,13 +607,21 @@ async function setupDefaultersChannelPermissions() {
     await setRolePermissions(channel, RAID_ROLE_ID, { view: true, send: false });
 
     for (const staffId of STAFF_USER_IDS) {
-      await channel.permissionOverwrites
-        .edit(staffId, {
+      try {
+        // permissionOverwrites.edit needs an actual User/GuildMember object
+        // (or a Role) to resolve against — a raw ID string only resolves if
+        // it happens to already be sitting in cache, which ours often won't
+        // be since we run with minimal caching. Fetching the member first
+        // guarantees a resolvable object every time.
+        const member = await channel.guild.members.fetch(staffId);
+        await channel.permissionOverwrites.edit(member, {
           ViewChannel: true,
           SendMessages: true,
           ManageMessages: true,
-        })
-        .catch((err) => console.error(`[setup] Could not set access for ${staffId}:`, err));
+        });
+      } catch (err) {
+        console.error(`[setup] Could not set access for ${staffId}:`, err);
+      }
     }
 
     console.log('[setup] Defaulters channel permissions configured.');
@@ -663,9 +671,6 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-console.log('[bot] Token found. Length:', DISCORD_TOKEN.length);
-console.log('[bot] Attempting login...');
-
 // ----------------------------------------------------------------------------
 // Keep-alive HTTP server (for Render)
 // ----------------------------------------------------------------------------
@@ -681,10 +686,7 @@ http
     console.log(`[http] Keep-alive server running on port ${PORT}`);
   });
 
-client.login(DISCORD_TOKEN)
-  .then(() => console.log('[bot] Login succeeded!'))
-  .catch((err) => {
-    console.error('[bot] LOGIN FAILED:', err.message);
-    console.error('[bot] Error code:', err.code);
-    process.exit(1);
-  });
+client.login(DISCORD_TOKEN).catch((err) => {
+  console.error('[bot] Failed to log in. Check that DISCORD_TOKEN is correct.', err);
+  process.exit(1);
+});
