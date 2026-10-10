@@ -10,6 +10,10 @@
 //   5. FINAL WARNING               — still non-compliant users are escalated:
 //      no role -> Warning 1 | Warning 1 -> Warning 2 | Warning 2 -> 7d timeout.
 //
+// The SAME warning ladder is used for two offences:
+//   - "Didn't complete engagement"
+//   - "Deleted the link" (deleting a submitted link during an active session)
+//
 // IMPORTANT CAVEATS (read before relying on this in production):
 //
 // - Reply verification uses Nitter, a free unofficial mirror of X. Public
@@ -19,6 +23,10 @@
 //   (treated as "unverifiable", never as "defaulted"), so a dead mirror does
 //   not get innocent members warned or timed out. The REACTION check uses
 //   native Discord data and is always reliable.
+// - Posts with comments disabled are detected from the Nitter page. For those
+//   posts the reply requirement is skipped and only the emoji reaction is
+//   required. Nitter (and X itself) does not expose WHO liked a post, so
+//   likes cannot be verified.
 // - Session state lives in memory. If the host restarts mid-session (Render's
 //   free tier sleeps/redeploys), that session's timers and participant data
 //   are lost. With the engagement + grace window now up to ~3 hours, that is
@@ -60,14 +68,20 @@ const STAFF_USER_IDS = [
 ];
 
 // --- Tracked emoji (the ONLY reaction allowed on participant posts) ---
-const TRACKED_EMOJI_ID = '1494782724022603827';
-const TRACKED_EMOJI_NAME = 'alya';
+const TRACKED_EMOJI_ID = '1558278278089936996';
+const TRACKED_EMOJI_NAME = 'Kucchi';
 const TRACKED_EMOJI_TAG = `<a:${TRACKED_EMOJI_NAME}:${TRACKED_EMOJI_ID}>`;
+// Format used when the bot itself reacts (documented "name:id" form).
+const TRACKED_EMOJI_REACTION = `${TRACKED_EMOJI_NAME}:${TRACKED_EMOJI_ID}`;
 
 // --- Other custom emojis used in message templates ---
-const EMOJI_BACK = '<a:alya:1494783730122752142>';
-const EMOJI_DEADLINE = '<a:alya:1494775877622435983>';
-const EMOJI_HAPPY = '<a:alya:1494940138860711936>';
+const EMOJI_BACK = '<a:Kucchi:1558273201027678208>';
+const EMOJI_DEADLINE = '<a:Kucchi:1558279883107606558>';
+const EMOJI_HAPPY = '<a:Kucchi:1558318070160687196>';
+
+// --- Warning reasons (shown in announcements) ---
+const REASON_ENGAGEMENT = "Didn't complete engagement";
+const REASON_DELETED_LINK = 'Deleted the link';
 
 // --- Nitter (best-effort, see caveats above) ---
 const NITTER_MIRRORS = ['https://nitter.net', 'https://nitter.poast.org'];
@@ -81,6 +95,13 @@ const ENGAGEMENT_SHORT_MS = 60 * 60 * 1000; // 1 hour  (<=20 links)
 const ENGAGEMENT_LONG_MS = 2 * 60 * 60 * 1000; // 2 hours (>20 links)
 const REMINDER_GRACE_MS = 60 * 60 * 1000; // 1 hour after soft reminder
 const WARNING_2_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000; // 7-day timeout
+const EARLY_SCAN_WINDOW_MS = 5 * 60 * 1000; // safety scan on session open
+
+// --- Link deletion policy ---
+// If true, deleting your link during the SUBMISSION phase is also warned.
+// Set to false if you want people to be able to delete + repost while the
+// submission window is still open (the link is still removed from the count).
+const WARN_ON_DELETE_DURING_SUBMISSION = true;
 
 // --- Cron ---
 const SESSION_1_CRON = '0 11 * * *'; // 11:00 AM
@@ -94,8 +115,12 @@ const TWITTER_LINK_REGEX =
 // In-memory state
 // ----------------------------------------------------------------------------
 
-const sessions = new Map(); // 'Morning' | 'Evening' -> session object
-const activeTrackedMessages = new Map(); // messageId -> sessionLabel
+// channelId -> session object. The global messageCreate / messageDelete
+// handlers use this to decide whether a message belongs to an active session.
+const sessions = new Map();
+
+// messageId -> channelId (of the session that tracks that message)
+const activeTrackedMessages = new Map();
 
 const SESSION_CHANNEL_IDS = new Set([MORNING_CHANNEL_ID, EVENING_CHANNEL_ID]);
 
@@ -123,8 +148,12 @@ function buildEveningOpeningMessage() {
   );
 }
 
-function buildClosingMessage(linkCount) {
-  const withinWindow = linkCount > LINK_COUNT_THRESHOLD ? '2 Hours' : '1 Hour';
+/**
+ * withinWindow is passed in (rather than recomputed from linkCount) so that
+ * when the message is edited after a link deletion, the stated engagement
+ * window still matches the timer that is actually running.
+ */
+function buildClosingMessage(linkCount, withinWindow) {
   return (
     `Alright, Fams, that's a wrap ${TRACKED_EMOJI_TAG}\n` +
     `The Raid Session Is Now Closed ${EMOJI_DEADLINE}\n` +
@@ -151,13 +180,19 @@ function buildSoftReminderMessage(defaulterIds) {
  * 'Warning 1' | 'Warning 2' | '7 Day Timeout'
  */
 function buildFinalWarningMessage(sessionLabel, outcomes) {
-  const lines = outcomes.map((o) => `<@${o.userId}> ( ${o.label} )`).join('\n');
+  const lines = outcomes
+    .map((o) => `<@${o.userId}> ( ${o.label} ) - ${REASON_ENGAGEMENT}`)
+    .join('\n');
   return (
     `Alright Fams ${EMOJI_HAPPY}\n` +
     `These Are The Defaulters Of ${sessionLabel} Engagement ${EMOJI_DEADLINE}\n` +
     `Below Mentioned Members Is Getting Warning ${TRACKED_EMOJI_TAG}\n` +
     `${lines}`
   );
+}
+
+function buildDeletedLinkMessage(userId, label) {
+  return `⚠️ <@${userId}> has received ${label} for: ${REASON_DELETED_LINK}`;
 }
 
 // ----------------------------------------------------------------------------
@@ -204,6 +239,30 @@ async function setRolePermissions(channel, roleId, { view, send }) {
   await channel.permissionOverwrites.edit(roleId, overwrite);
 }
 
+function collectParticipantLinks(session) {
+  return Array.from(session.participants.entries()).map(([userId, data]) => ({
+    userId,
+    ...data,
+  }));
+}
+
+/** Schedules a timer that is automatically cleared when the session ends. */
+function scheduleForSession(session, fn, ms) {
+  const timer = setTimeout(fn, ms);
+  session.timers.push(timer);
+  return timer;
+}
+
+/** Removes a participant and everything tracked for their post. */
+function removeParticipant(session, userId) {
+  const entry = session.participants.get(userId);
+  if (!entry) return null;
+  session.participants.delete(userId);
+  activeTrackedMessages.delete(entry.messageId);
+  session.reactions.delete(entry.messageId);
+  return entry;
+}
+
 // ----------------------------------------------------------------------------
 // Nitter verification (best-effort — see caveats at top of file)
 // ----------------------------------------------------------------------------
@@ -244,6 +303,43 @@ function pageMentionsHandle(pageText, handle) {
   return lower.includes(`/${needle}`) || lower.includes(`@${needle}`);
 }
 
+const COMMENTS_DISABLED_PHRASES = [
+  'replies are disabled',
+  'replies disabled',
+  'comments are disabled',
+  'comments disabled',
+  'limited who can reply',
+  'who can reply',
+];
+
+/**
+ * Heuristic: were replies disabled / unavailable for this post?
+ * Returns true if ANY of these hold:
+ *   - the page contains an explicit "replies are disabled"-style notice
+ *   - the page has no reply section (no <div class="replies">) at all
+ *   - the reply section exists but contains no reply items
+ *
+ * When this returns true the reply requirement is skipped for the post.
+ * Note this also fires when a post simply has zero replies or when Nitter
+ * returns a stripped-down page — that errs on the lenient side (nobody gets
+ * warned for a post whose replies we can't confirm).
+ */
+function detectCommentsDisabled(pageText) {
+  const lower = pageText.toLowerCase();
+
+  if (COMMENTS_DISABLED_PHRASES.some((phrase) => lower.includes(phrase))) {
+    return true;
+  }
+
+  const repliesMarker = lower.search(/class="replies[\s"]/);
+  if (repliesMarker === -1) return true; // reply section absent
+
+  const repliesSection = lower.slice(repliesMarker);
+  if (!repliesSection.includes('timeline-item')) return true; // container empty
+
+  return false;
+}
+
 // ----------------------------------------------------------------------------
 // Reaction tracking + reaction policing
 // ----------------------------------------------------------------------------
@@ -277,9 +373,9 @@ client.on('messageReactionAdd', async (reaction, user) => {
     }
 
     // --- Tracking: record the reaction if it's on a participant's post ---
-    const sessionLabel = activeTrackedMessages.get(reaction.message.id);
-    if (!sessionLabel) return;
-    const session = sessions.get(sessionLabel);
+    const trackedChannelId = activeTrackedMessages.get(reaction.message.id);
+    if (!trackedChannelId) return;
+    const session = sessions.get(trackedChannelId);
     if (!session) return;
 
     trackReactions(session, reaction.message.id, user.id);
@@ -292,14 +388,120 @@ client.on('messageReactionAdd', async (reaction, user) => {
 // Submission phase
 // ----------------------------------------------------------------------------
 
-function collectParticipantLinks(session) {
-  return Array.from(session.participants.entries()).map(([userId, data]) => ({
-    userId,
-    ...data,
-  }));
+async function memberHasRaidRole(message) {
+  try {
+    const member =
+      message.member || (await message.guild.members.fetch(message.author.id));
+    return member.roles.cache.has(RAID_ROLE_ID);
+  } catch (err) {
+    console.error('[submission] Could not resolve member for role check:', err);
+    return false;
+  }
+}
+
+/**
+ * Bot reacts first so non-Nitro members can piggyback on the bot's reaction
+ * to add the animated emoji themselves. One retry on failure.
+ */
+async function reactToSubmission(message) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await message.react(TRACKED_EMOJI_REACTION);
+      return true;
+    } catch (err) {
+      if (err && err.code === 10008) return false; // message already deleted
+      console.error(`[submission] Auto-react failed (attempt ${attempt}):`, err);
+      if (attempt < 2) await sleep(1000);
+    }
+  }
+  return false;
+}
+
+/**
+ * Handles one candidate submission message. Idempotent per message id, so it
+ * is safe for both the live handler and the on-open safety scan to call it.
+ */
+async function processSubmission(session, message) {
+  if (session.processedMessageIds.has(message.id)) return;
+  session.processedMessageIds.add(message.id);
+
+  const content = message.content || '';
+  const hasHttpLink = /https?:\/\//i.test(content);
+
+  const isRaidMember = await memberHasRaidRole(message);
+  if (isRaidMember && hasHttpLink) {
+    await reactToSubmission(message);
+  }
+
+  const parsed = parseTwitterLink(content);
+  if (!parsed) return; // not a valid X/Twitter status link — don't register as a submission
+
+  // The window may have closed while we were awaiting above.
+  if (session.stage !== 'submission') return;
+
+  // Last submitted link wins if a user posts more than once. Stop tracking
+  // the superseded post so deleting it later isn't treated as a violation.
+  const previous = session.participants.get(message.author.id);
+  if (previous && previous.messageId !== message.id) {
+    activeTrackedMessages.delete(previous.messageId);
+    session.reactions.delete(previous.messageId);
+  }
+
+  session.participants.set(message.author.id, {
+    handle: parsed.handle,
+    statusId: parsed.statusId,
+    link: content.trim(),
+    messageId: message.id,
+  });
+
+  // Register for reaction tracking immediately (not just after lock) so
+  // reactions added during the submission phase still count.
+  activeTrackedMessages.set(message.id, session.channelId);
+}
+
+// Global handler: no per-session collector, so there is no registration gap
+// between the opening announcement and the first submissions.
+client.on('messageCreate', async (message) => {
+  try {
+    if (!message.guild) return;
+    if (!message.author || message.author.bot) return;
+
+    const session = sessions.get(message.channelId);
+    if (!session || session.stage !== 'submission') return;
+
+    await processSubmission(session, message);
+  } catch (err) {
+    console.error('[messageCreate] Failed to process message:', err);
+  }
+});
+
+/**
+ * Safety net: on session open, sweep the last few minutes of the channel for
+ * links that the live handler might not have seen.
+ */
+async function scanRecentSubmissions(session, channel) {
+  try {
+    const cutoff = Date.now() - EARLY_SCAN_WINDOW_MS;
+    const fetched = await channel.messages.fetch({ limit: 50 });
+    const recent = Array.from(fetched.values())
+      .filter((m) => !m.author.bot && m.createdTimestamp >= cutoff)
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp); // oldest first
+
+    for (const m of recent) {
+      if (session.stage !== 'submission') break;
+      await processSubmission(session, m);
+    }
+
+    console.log(
+      `[openRaidSession] (${session.label}) Safety scan checked ${recent.length} recent message(s).`
+    );
+  } catch (err) {
+    console.error(`[openRaidSession] (${session.label}) Safety scan failed:`, err);
+  }
 }
 
 async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
+  let session = null;
   try {
     const channel = await client.channels.fetch(channelId);
     if (!channel || !channel.isTextBased()) {
@@ -309,16 +511,31 @@ async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
 
     console.log(`[openRaidSession] (${sessionLabel}) Opening submission phase.`);
 
-    // Submission phase: raid role can view + send.
-    await setRolePermissions(channel, RAID_ROLE_ID, { view: true, send: true });
+    // A leftover session in this channel (shouldn't happen) is discarded.
+    const existing = sessions.get(channelId);
+    if (existing) {
+      console.warn(`[openRaidSession] (${sessionLabel}) Discarding unfinished previous session.`);
+      endSession(existing);
+    }
 
-    const session = {
+    // Create + register the session BEFORE opening the channel so the global
+    // handler is ready for the very first message.
+    session = {
+      label: sessionLabel,
       channelId,
       stage: 'submission',
       participants: new Map(), // userId -> { handle, statusId, link, messageId }
       reactions: new Map(), // messageId -> Set<userId>
+      processedMessageIds: new Set(),
+      deletionWarned: new Set(), // userIds already warned for deleting a link this session
+      closingMessage: null,
+      engagementLabel: null,
+      timers: [],
     };
-    sessions.set(sessionLabel, session);
+    sessions.set(channelId, session);
+
+    // Submission phase: raid role can view + send.
+    await setRolePermissions(channel, RAID_ROLE_ID, { view: true, send: true });
 
     await channel.send({
       content: buildOpeningMessageFn(),
@@ -327,114 +544,210 @@ async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
 
     console.log(`[openRaidSession] (${sessionLabel}) Collecting links for 30 minutes.`);
 
-    const collector = channel.createMessageCollector({ time: SUBMISSION_DURATION_MS });
+    // Catch anything posted in the last few minutes that we haven't handled.
+    await scanRecentSubmissions(session, channel);
 
-    collector.on('collect', async (message) => {
-      if (message.author.bot) return;
-
-      const isRaidMember = Boolean(message.member && message.member.roles.cache.has(RAID_ROLE_ID));
-      const hasHttpLink = /https?:\/\//i.test(message.content || '');
-
-      // Bot reacts first so non-Nitro members can piggyback on the bot's
-      // reaction to add the animated emoji themselves.
-      if (isRaidMember && hasHttpLink) {
-        await message.react(TRACKED_EMOJI_ID).catch((err) => {
-          console.error('[collector] Failed to auto-react to link submission:', err);
+    const openedSession = session;
+    scheduleForSession(
+      openedSession,
+      () => {
+        closeSubmissionChannel(openedSession).catch((err) => {
+          console.error(`[closeSubmissionChannel] (${sessionLabel}) Unhandled error:`, err);
         });
-      }
-
-      const parsed = parseTwitterLink(message.content);
-      if (!parsed) return; // not a valid X/Twitter status link — don't register as a submission
-
-      // Last submitted link wins if a user posts more than once.
-      session.participants.set(message.author.id, {
-        handle: parsed.handle,
-        statusId: parsed.statusId,
-        link: message.content.trim(),
-        messageId: message.id,
-      });
-
-      // Register for reaction tracking immediately (not just after lock) so
-      // reactions added during the submission phase still count.
-      activeTrackedMessages.set(message.id, sessionLabel);
-    });
-
-    collector.on('end', () => {
-      closeSubmissionChannel(channelId, sessionLabel).catch((err) => {
-        console.error(`[closeSubmissionChannel] (${sessionLabel}) Unhandled error:`, err);
-      });
-    });
+      },
+      SUBMISSION_DURATION_MS
+    );
   } catch (err) {
     console.error(`[openRaidSession] (${sessionLabel}) Failed to open session:`, err);
+    if (session && sessions.get(channelId) === session) endSession(session);
   }
 }
 
-async function closeSubmissionChannel(channelId, sessionLabel) {
-  const channel = await client.channels.fetch(channelId);
+async function closeSubmissionChannel(session) {
+  if (sessions.get(session.channelId) !== session) return;
+  session.stage = 'locked';
+
+  const channel = await client.channels.fetch(session.channelId);
   if (!channel || !channel.isTextBased()) {
-    console.error(`[closeSubmissionChannel] (${sessionLabel}) Could not resolve channel.`);
+    console.error(`[closeSubmissionChannel] (${session.label}) Could not resolve channel.`);
     return;
   }
 
-  const session = sessions.get(sessionLabel);
-  if (!session) return;
-
-  console.log(`[closeSubmissionChannel] (${sessionLabel}) Locking channel.`);
-  session.stage = 'locked';
+  console.log(`[closeSubmissionChannel] (${session.label}) Locking channel.`);
 
   // Locked: raid role keeps View, loses Send. They can still react.
   await setRolePermissions(channel, RAID_ROLE_ID, { view: true, send: false });
 
-  const participants = collectParticipantLinks(session);
-  const linkCount = participants.length;
-  console.log(`[closeSubmissionChannel] (${sessionLabel}) ${linkCount} link(s) submitted.`);
+  const linkCount = session.participants.size;
+  session.engagementLabel = linkCount > LINK_COUNT_THRESHOLD ? '2 Hours' : '1 Hour';
+  console.log(`[closeSubmissionChannel] (${session.label}) ${linkCount} link(s) submitted.`);
 
-  await channel.send({
-    content: buildClosingMessage(linkCount),
+  session.closingMessage = await channel.send({
+    content: buildClosingMessage(linkCount, session.engagementLabel),
     allowedMentions: { parse: [] },
   });
 
-  // (Participant posts were already registered for reaction tracking the
-  // moment they were collected, so non-Nitro reactions during submission
-  // still count toward compliance.)
+  // If a link was deleted while the closing message was being sent, fix the count.
+  if (session.participants.size !== linkCount) {
+    await refreshClosingMessage(session);
+  }
 
   if (linkCount === 0) {
-    console.log(`[closeSubmissionChannel] (${sessionLabel}) No links submitted — ending session.`);
-    endSession(sessionLabel);
+    console.log(`[closeSubmissionChannel] (${session.label}) No links submitted — ending session.`);
+    endSession(session);
     return;
   }
 
-  startEngagementPhase(session, sessionLabel, linkCount);
+  startEngagementPhase(session, linkCount);
 }
+
+/** Edits the already-posted closing message so the link total stays accurate. */
+async function refreshClosingMessage(session) {
+  if (!session.closingMessage) return;
+  try {
+    await session.closingMessage.edit({
+      content: buildClosingMessage(session.participants.size, session.engagementLabel),
+      allowedMentions: { parse: [] },
+    });
+  } catch (err) {
+    console.error(`[closingMessage] (${session.label}) Could not update link count:`, err);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Deleted links
+// ----------------------------------------------------------------------------
+
+/**
+ * Called when a tracked message is deleted. Works from the message id alone,
+ * because deleted messages are frequently uncached (no author available).
+ */
+async function handleDeletedLink(messageId) {
+  const channelId = activeTrackedMessages.get(messageId);
+  if (!channelId) return;
+
+  const session = sessions.get(channelId);
+  if (!session) {
+    activeTrackedMessages.delete(messageId);
+    return;
+  }
+
+  // Do all in-memory removal synchronously, before any await, so duplicate
+  // delete events (e.g. single + bulk) can't process the same link twice.
+  const entry = collectParticipantLinks(session).find((p) => p.messageId === messageId);
+  activeTrackedMessages.delete(messageId);
+  session.reactions.delete(messageId);
+  if (!entry) return; // superseded/untracked post — nothing to penalize
+
+  removeParticipant(session, entry.userId);
+  console.log(
+    `[deletedLink] (${session.label}) ${entry.userId} deleted their link — removed from session.`
+  );
+
+  // Keep the posted total in sync (only exists once the session has closed).
+  await refreshClosingMessage(session);
+
+  // Penalize the deleter (once per session). Nobody else is affected: the
+  // post is gone from the session, so no one is checked against it.
+  if (session.stage === 'submission' && !WARN_ON_DELETE_DURING_SUBMISSION) return;
+  if (session.deletionWarned.has(entry.userId)) return;
+  session.deletionWarned.add(entry.userId);
+
+  try {
+    const defaultersChannel = await client.channels.fetch(DEFAULTERS_CHANNEL_ID);
+    const outcome = await applyWarning(defaultersChannel.guild, entry.userId);
+
+    await defaultersChannel.send({
+      content: buildDeletedLinkMessage(entry.userId, outcome.label),
+      allowedMentions: { users: [entry.userId] },
+    });
+  } catch (err) {
+    console.error(`[deletedLink] (${session.label}) Failed to warn ${entry.userId}:`, err);
+  }
+}
+
+client.on('messageDelete', async (message) => {
+  try {
+    if (!SESSION_CHANNEL_IDS.has(message.channelId)) return;
+    await handleDeletedLink(message.id);
+  } catch (err) {
+    console.error('[messageDelete] Failed to process deletion:', err);
+  }
+});
+
+client.on('messageDeleteBulk', async (messages) => {
+  try {
+    for (const id of messages.keys()) {
+      await handleDeletedLink(id);
+    }
+  } catch (err) {
+    console.error('[messageDeleteBulk] Failed to process deletions:', err);
+  }
+});
 
 // ----------------------------------------------------------------------------
 // Engagement phase
 // ----------------------------------------------------------------------------
 
-function startEngagementPhase(session, sessionLabel, linkCount) {
+function startEngagementPhase(session, linkCount) {
   session.stage = 'engagement';
   const duration = linkCount > LINK_COUNT_THRESHOLD ? ENGAGEMENT_LONG_MS : ENGAGEMENT_SHORT_MS;
 
   console.log(
-    `[startEngagementPhase] (${sessionLabel}) Engagement window: ${duration / 60000} minute(s).`
+    `[startEngagementPhase] (${session.label}) Engagement window: ${duration / 60000} minute(s).`
   );
 
-  setTimeout(() => {
-    runComplianceCheck(sessionLabel).catch((err) => {
-      console.error(`[runComplianceCheck] (${sessionLabel}) Unhandled error:`, err);
-    });
-  }, duration);
+  scheduleForSession(
+    session,
+    () => {
+      runComplianceCheck(session).catch((err) => {
+        console.error(`[runComplianceCheck] (${session.label}) Unhandled error:`, err);
+      });
+    },
+    duration
+  );
+}
+
+/**
+ * Safety net for missed delete events (e.g. the bot was briefly offline):
+ * any participant whose post no longer exists is dropped from the session
+ * silently, so nobody is checked against a post that can't be engaged with.
+ */
+async function pruneDeletedPosts(session) {
+  let channel;
+  try {
+    channel = await client.channels.fetch(session.channelId);
+  } catch (err) {
+    console.error(`[compliance] (${session.label}) Could not fetch channel to verify posts:`, err);
+    return;
+  }
+
+  for (const p of collectParticipantLinks(session)) {
+    try {
+      await channel.messages.fetch(p.messageId);
+    } catch (err) {
+      if (err && err.code === 10008) {
+        console.warn(
+          `[compliance] (${session.label}) Post ${p.messageId} no longer exists — removing ${p.userId} from checks.`
+        );
+        removeParticipant(session, p.userId);
+      }
+    }
+  }
 }
 
 /**
  * For every participant's post, checks whether each OTHER participant both
  * reacted (reliable) and replied on X (best-effort via Nitter).
- * Returns Map<userId, { missingReactions: string[], missingReplies: string[] }>
- * containing only members with at least one gap.
+ * Posts with comments disabled only require the reaction.
+ * Returns Map<userId, { missingReactions, missingReplies }> containing only
+ * members with at least one gap. Entries are { handle, messageId }.
  */
 async function checkEngagementCompliance(session) {
-  const participants = collectParticipantLinks(session);
+  await pruneDeletedPosts(session);
+
   const defaulters = new Map();
+  if (session.participants.size < 2) return defaulters;
 
   const ensure = (userId) => {
     if (!defaulters.has(userId)) {
@@ -443,14 +756,21 @@ async function checkEngagementCompliance(session) {
     return defaulters.get(userId);
   };
 
-  for (const poster of participants) {
+  for (const poster of collectParticipantLinks(session)) {
+    // Skip posts deleted while this (slow) check is running.
+    const live = session.participants.get(poster.userId);
+    if (!live || live.messageId !== poster.messageId) continue;
+
     const reactors = session.reactions.get(poster.messageId) || new Set();
-    const others = participants.filter((p) => p.userId !== poster.userId);
+    const others = collectParticipantLinks(session).filter((p) => p.userId !== poster.userId);
 
     // --- Reaction check (always reliable) ---
     for (const other of others) {
       if (!reactors.has(other.userId)) {
-        ensure(other.userId).missingReactions.push(poster.handle);
+        ensure(other.userId).missingReactions.push({
+          handle: poster.handle,
+          messageId: poster.messageId,
+        });
       }
     }
 
@@ -460,15 +780,33 @@ async function checkEngagementCompliance(session) {
       console.warn(
         `[compliance] Nitter unreachable for @${poster.handle} — skipping reply check for this post.`
       );
+    } else if (detectCommentsDisabled(pageText)) {
+      console.log(
+        `[compliance] Comments disabled/unavailable on @${poster.handle}'s post — reaction only.`
+      );
     } else {
       for (const other of others) {
         if (!pageMentionsHandle(pageText, other.handle)) {
-          ensure(other.userId).missingReplies.push(poster.handle);
+          ensure(other.userId).missingReplies.push({
+            handle: poster.handle,
+            messageId: poster.messageId,
+          });
         }
       }
     }
 
     await sleep(NITTER_REQUEST_DELAY_MS);
+  }
+
+  // Final cleanup: if anyone deleted their link mid-check, drop them and drop
+  // every gap that was recorded against their post.
+  const stillPosted = new Set(collectParticipantLinks(session).map((p) => p.messageId));
+  for (const [userId, record] of defaulters) {
+    record.missingReactions = record.missingReactions.filter((e) => stillPosted.has(e.messageId));
+    record.missingReplies = record.missingReplies.filter((e) => stillPosted.has(e.messageId));
+    const stillParticipant = session.participants.has(userId);
+    const hasGap = record.missingReactions.length > 0 || record.missingReplies.length > 0;
+    if (!stillParticipant || !hasGap) defaulters.delete(userId);
   }
 
   return defaulters;
@@ -488,37 +826,51 @@ async function remindDefaulters(defaulterIds, channelId) {
   });
 }
 
+// ----------------------------------------------------------------------------
+// Combined warning system (engagement failures AND deleted links)
+// ----------------------------------------------------------------------------
+
 /**
- * Applies escalation per defaulter and returns the outcome labels for the
- * final warning message.
+ * Applies one step of escalation to a single member and returns
+ * { userId, label } where label is 'Warning 1' | 'Warning 2' | '7 Day Timeout'.
  *   no warning role -> Warning 1
  *   has Warning 1   -> remove Warning 1, add Warning 2
  *   has Warning 2   -> 7-day timeout (Warning 2 is kept, not removed)
  * Discord expires timeouts on its own after the duration, so no cleanup job
  * is needed to lift the 7-day timeout.
+ *
+ * Throws if the member can't be fetched or a role can't be added.
  */
+async function applyWarning(guild, userId) {
+  // force: true so we never escalate from a stale cached role list.
+  const member = await guild.members.fetch({ user: userId, force: true });
+  const hasWarning1 = member.roles.cache.has(WARNING_ROLE_1_ID);
+  const hasWarning2 = member.roles.cache.has(WARNING_ROLE_2_ID);
+
+  if (hasWarning2) {
+    await member
+      .timeout(WARNING_2_TIMEOUT_MS, 'Repeated raid violation')
+      .catch((err) => console.error(`[warnings] Timeout failed for ${userId}:`, err));
+    return { userId, label: '7 Day Timeout' };
+  }
+
+  if (hasWarning1) {
+    await member.roles.remove(WARNING_ROLE_1_ID).catch(() => {});
+    await member.roles.add(WARNING_ROLE_2_ID);
+    return { userId, label: 'Warning 2' };
+  }
+
+  await member.roles.add(WARNING_ROLE_1_ID);
+  return { userId, label: 'Warning 1' };
+}
+
+/** Escalates every engagement defaulter; returns outcomes for the announcement. */
 async function assignWarningRoles(defaulterIds, guild) {
   const outcomes = [];
 
   for (const userId of defaulterIds) {
     try {
-      const member = await guild.members.fetch(userId);
-      const hasWarning1 = member.roles.cache.has(WARNING_ROLE_1_ID);
-      const hasWarning2 = member.roles.cache.has(WARNING_ROLE_2_ID);
-
-      if (hasWarning2) {
-        await member
-          .timeout(WARNING_2_TIMEOUT_MS, 'Repeated raid engagement violation')
-          .catch((err) => console.error(`[warnings] Timeout failed for ${userId}:`, err));
-        outcomes.push({ userId, label: '7 Day Timeout' });
-      } else if (hasWarning1) {
-        await member.roles.remove(WARNING_ROLE_1_ID).catch(() => {});
-        await member.roles.add(WARNING_ROLE_2_ID);
-        outcomes.push({ userId, label: 'Warning 2' });
-      } else {
-        await member.roles.add(WARNING_ROLE_1_ID);
-        outcomes.push({ userId, label: 'Warning 1' });
-      }
+      outcomes.push(await applyWarning(guild, userId));
     } catch (err) {
       console.error(`[warnings] Failed to process defaulter ${userId}:`, err);
     }
@@ -527,40 +879,42 @@ async function assignWarningRoles(defaulterIds, guild) {
   return outcomes;
 }
 
-async function runComplianceCheck(sessionLabel) {
-  const session = sessions.get(sessionLabel);
-  if (!session) return;
+async function runComplianceCheck(session) {
+  if (sessions.get(session.channelId) !== session) return;
 
-  console.log(`[runComplianceCheck] (${sessionLabel}) First compliance check.`);
+  console.log(`[runComplianceCheck] (${session.label}) First compliance check.`);
   const defaulters = await checkEngagementCompliance(session);
   const defaulterIds = Array.from(defaulters.keys());
 
   if (defaulterIds.length === 0) {
-    console.log(`[runComplianceCheck] (${sessionLabel}) Everyone compliant.`);
-    endSession(sessionLabel);
+    console.log(`[runComplianceCheck] (${session.label}) Everyone compliant.`);
+    endSession(session);
     return;
   }
 
   await remindDefaulters(defaulterIds, DEFAULTERS_CHANNEL_ID);
 
-  setTimeout(() => {
-    runFinalCheck(sessionLabel).catch((err) => {
-      console.error(`[runFinalCheck] (${sessionLabel}) Unhandled error:`, err);
-    });
-  }, REMINDER_GRACE_MS);
+  scheduleForSession(
+    session,
+    () => {
+      runFinalCheck(session).catch((err) => {
+        console.error(`[runFinalCheck] (${session.label}) Unhandled error:`, err);
+      });
+    },
+    REMINDER_GRACE_MS
+  );
 }
 
-async function runFinalCheck(sessionLabel) {
-  const session = sessions.get(sessionLabel);
-  if (!session) return;
+async function runFinalCheck(session) {
+  if (sessions.get(session.channelId) !== session) return;
 
-  console.log(`[runFinalCheck] (${sessionLabel}) Final compliance check.`);
+  console.log(`[runFinalCheck] (${session.label}) Final compliance check.`);
   const defaulters = await checkEngagementCompliance(session);
   const defaulterIds = Array.from(defaulters.keys());
 
   if (defaulterIds.length === 0) {
-    console.log(`[runFinalCheck] (${sessionLabel}) Everyone caught up during the grace period.`);
-    endSession(sessionLabel);
+    console.log(`[runFinalCheck] (${session.label}) Everyone caught up during the grace period.`);
+    endSession(session);
     return;
   }
 
@@ -570,26 +924,31 @@ async function runFinalCheck(sessionLabel) {
 
     if (outcomes.length > 0) {
       await channel.send({
-        content: buildFinalWarningMessage(sessionLabel, outcomes),
+        content: buildFinalWarningMessage(session.label, outcomes),
         allowedMentions: { users: outcomes.map((o) => o.userId) },
       });
     }
   } catch (err) {
-    console.error(`[runFinalCheck] (${sessionLabel}) Failed to apply warnings:`, err);
+    console.error(`[runFinalCheck] (${session.label}) Failed to apply warnings:`, err);
   }
 
-  endSession(sessionLabel);
+  endSession(session);
 }
 
-function endSession(sessionLabel) {
-  const session = sessions.get(sessionLabel);
-  if (!session) return;
+function endSession(session) {
+  for (const timer of session.timers) clearTimeout(timer);
+  session.timers = [];
 
-  for (const p of collectParticipantLinks(session)) {
-    activeTrackedMessages.delete(p.messageId);
+  // Clear every tracked message that points at this session's channel
+  // (includes superseded posts that are no longer in participants).
+  for (const [messageId, channelId] of activeTrackedMessages) {
+    if (channelId === session.channelId) activeTrackedMessages.delete(messageId);
   }
-  sessions.delete(sessionLabel);
-  console.log(`[endSession] (${sessionLabel}) Session state cleared.`);
+
+  if (sessions.get(session.channelId) === session) {
+    sessions.delete(session.channelId);
+  }
+  console.log(`[endSession] (${session.label}) Session state cleared.`);
 }
 
 // ----------------------------------------------------------------------------
