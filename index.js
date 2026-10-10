@@ -1049,3 +1049,4 @@ client.login(DISCORD_TOKEN).catch((err) => {
   console.error('[bot] Failed to log in. Check that DISCORD_TOKEN is correct.', err);
   process.exit(1);
 });
+
