@@ -40,6 +40,7 @@ const {
   GatewayIntentBits,
   Partials,
   Options,
+  escapeMarkdown,
 } = require('discord.js');
 const cron = require('node-cron');
 const http = require('http');
@@ -54,6 +55,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const MORNING_CHANNEL_ID = '1409772569556684851';
 const EVENING_CHANNEL_ID = '1442484747191320678';
 const DEFAULTERS_CHANNEL_ID = '1546519372250620074';
+const LOUNGE_CHANNEL_ID = '1409772686799798283'; // !GuideMeKucchi works ONLY here
 
 // --- Roles ---
 const RAID_ROLE_ID = '1459120132235329536';
@@ -78,6 +80,8 @@ const TRACKED_EMOJI_REACTION = `${TRACKED_EMOJI_NAME}:${TRACKED_EMOJI_ID}`;
 const EMOJI_BACK = '<a:Kucchi:1558273201027678208>';
 const EMOJI_DEADLINE = '<a:Kucchi:1558279883107606558>';
 const EMOJI_HAPPY = '<a:Kucchi:1558318070160687196>';
+const EMOJI_EDIT_WARNING = '<a:Kucchi:1559516166144401488>';
+const EMOJI_DOUBLE_CHECK = '<a:Kucchi:1558341990129598464>';
 
 // --- Warning reasons (shown in announcements) ---
 const REASON_ENGAGEMENT = "Didn't complete engagement";
@@ -108,6 +112,8 @@ const SESSION_1_CRON = '0 11 * * *'; // 11:00 AM
 const SESSION_2_CRON = '0 18 * * *'; // 6:00 PM
 const CRON_TIMEZONE = 'Asia/Karachi';
 
+const GUIDE_COMMAND = '!GuideMeKucchi';
+
 const TWITTER_LINK_REGEX =
   /(?:https?:\/\/)?(?:www\.)?(?:twitter\.com|x\.com)\/([A-Za-z0-9_]{1,15})\/status(?:es)?\/(\d+)/i;
 
@@ -133,7 +139,8 @@ function buildMorningOpeningMessage() {
     `||<@&${RAID_ROLE_ID}>||\n` +
     `I'm Back Fams ${EMOJI_BACK}\n` +
     `The morning raid session is officially open. You have 30 minutes to submit your links in the channel. Any links posted after the deadline will not be considered ${EMOJI_DEADLINE}\n` +
-    `If your links getting removed, kindly remove your tracking ID and try again ${TRACKED_EMOJI_TAG}\n` +
+    `If your link gets removed, kindly remove your tracking ID and try again ${TRACKED_EMOJI_TAG}\n` +
+    `Don't delete your link, edit it instead to avoid a warning ${EMOJI_EDIT_WARNING}\n` +
     `Wishing everyone happy engagement and great interactions ${EMOJI_HAPPY}`
   );
 }
@@ -143,7 +150,8 @@ function buildEveningOpeningMessage() {
     `||<@&${RAID_ROLE_ID}>||\n` +
     `I'm Back Fams ${EMOJI_BACK}\n` +
     `The evening raid session is officially open. You have 30 minutes to submit your links in the channel. Any links posted after the deadline will not be considered ${EMOJI_DEADLINE}\n` +
-    `If your links getting removed, kindly remove your tracking ID and try again ${TRACKED_EMOJI_TAG}\n` +
+    `If your link gets removed, kindly remove your tracking ID and try again ${TRACKED_EMOJI_TAG}\n` +
+    `Don't delete your link, edit it instead to avoid a warning ${EMOJI_EDIT_WARNING}\n` +
     `Wishing everyone happy engagement and great interactions ${EMOJI_HAPPY}`
   );
 }
@@ -158,8 +166,28 @@ function buildClosingMessage(linkCount, withinWindow) {
     `Alright, Fams, that's a wrap ${TRACKED_EMOJI_TAG}\n` +
     `The Raid Session Is Now Closed ${EMOJI_DEADLINE}\n` +
     `Total Links Submitted: ${linkCount} ${EMOJI_HAPPY}\n` +
+    `Double Check Your Engagement That Is (Like & Reply On X, React On Every Link Here ${EMOJI_DOUBLE_CHECK})\n` +
     `Complete Your Engagements Within ${withinWindow} ${EMOJI_HAPPY}\n` +
-    `If someone didn't complete engagement please report it in <#1414278885260005496>`
+    `If someone didn't complete the engagement please report it in <#1414278885260005496>`
+  );
+}
+
+/** Reply for the !GuideMeKucchi command. displayName is inserted as plain text. */
+function buildGuideMessage(displayName) {
+  return (
+    `Yoo fella ${displayName} Welcome to the server <a:Kucchi:1558444604129280101>\n` +
+    `\n` +
+    `Explore OMC https://discord.com/channels/1343701000174698602/1459852660780961824 <a:Kucchi:1558278278089936996>\n` +
+    `\n` +
+    `Quick Guide <a:Kucchi:1558278278089936996>\n` +
+    `\n` +
+    `- First grab the **Engagement Role** <:Kucchi:1558270758101328023> from here https://discord.com/channels/1343701000174698602/1517589732748693534 <a:Kucchi:1558444641924419656>\n` +
+    `- Then you'll see both **Morning & Evening** engagement channels <a:Kucchi:1558342054965420142>\n` +
+    `- Then head over to https://discord.com/channels/1343701000174698602/1409772210465542236 to check **Rules & Timings** of engagement. The bot will reflect your local time zone <a:Kucchi:1558444438039302204>\n` +
+    `- During raid time, the server bot will open & close the engagement channel automatically for 30 minutes for submitting the link, so send your link in the meantime. No late submissions allowed because the channel will be locked <a:Kucchi:1558341684587397231>\n` +
+    `- For any queries tag my **Queen & Rockstar** from <@&1452929346162524335> and if they are unable to respond then tag <@&1414655205554786390> <a:Kucchi:1558342633246429235>\n` +
+    `\n` +
+    `Have a great time here fella <a:Kucchi:1558444560613384212>`
   );
 }
 
@@ -465,6 +493,25 @@ client.on('messageCreate', async (message) => {
   try {
     if (!message.guild) return;
     if (!message.author || message.author.bot) return;
+
+    // !GuideMeKucchi works ONLY in the Lounge channel; anywhere else it is ignored.
+    if ((message.content || '').trim() === GUIDE_COMMAND) {
+      if (message.channelId !== LOUNGE_CHANNEL_ID) return;
+
+      const rawName =
+        (message.member && message.member.displayName) ||
+        message.author.globalName ||
+        message.author.username;
+
+      await message
+        .reply({
+          content: buildGuideMessage(escapeMarkdown(rawName)),
+          // The name is plain text, so nobody is pinged (the staff roles show but don't ping).
+          allowedMentions: { parse: [], repliedUser: false },
+        })
+        .catch((err) => console.error('[guide] Failed to send guide message:', err));
+      return;
+    }
 
     const session = sessions.get(message.channelId);
     if (!session || session.stage !== 'submission') return;
@@ -978,8 +1025,9 @@ async function setupDefaultersChannelPermissions() {
           SendMessages: true,
           ManageMessages: true,
         });
+        console.log(`[setup] Access granted to ${member.user.tag}`);
       } catch (err) {
-        console.error(`[setup] Could not set access for ${staffId}:`, err);
+        console.error(`[setup] Could not set access for ${staffId}:`, err.message);
       }
     }
 
@@ -1049,4 +1097,3 @@ client.login(DISCORD_TOKEN).catch((err) => {
   console.error('[bot] Failed to log in. Check that DISCORD_TOKEN is correct.', err);
   process.exit(1);
 });
-
