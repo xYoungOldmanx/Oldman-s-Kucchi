@@ -27,13 +27,21 @@
 //   posts the reply requirement is skipped and only the emoji reaction is
 //   required. Nitter (and X itself) does not expose WHO liked a post, so
 //   likes cannot be verified.
-// - Session state lives in memory. If the host restarts mid-session (Render's
-//   free tier sleeps/redeploys), that session's timers and participant data
-//   are lost. With the engagement + grace window now up to ~3 hours, that is
+// - Deleted-link warnings use the Guild Audit Log (needs the bot to have the
+//   "View Audit Log" permission). Discord only writes an audit entry when
+//   SOMEONE ELSE deletes a message, so "no entry" = the author deleted it.
+//   If the audit log can't be read, the bot fails safe and does NOT warn.
+// - Session state lives in memory. If the container restarts mid-session
+//   (crash, redeploy, host maintenance), that session's timers and participant
+//   data are lost. With the engagement + grace window now up to ~3 hours, that is
 //   a meaningful exposure window.
 // ============================================================================
 
 require('dotenv').config();
+
+// Printed the moment the process boots, before anything else can fail — if you
+// see this line in the console, the container (re)started at that time.
+console.log('[system] Bot restarted. Re-initializing cron jobs...');
 
 const {
   Client,
@@ -41,9 +49,23 @@ const {
   Partials,
   Options,
   escapeMarkdown,
+  AuditLogEvent,
+  PermissionFlagsBits,
+  Events,
+  DiscordjsErrorCodes,
 } = require('discord.js');
 const cron = require('node-cron');
 const http = require('http');
+
+// ----------------------------------------------------------------------------
+// Global error handlers — log and keep running (never exit on a stray error)
+// ----------------------------------------------------------------------------
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+});
 
 // ----------------------------------------------------------------------------
 // Configuration
@@ -107,10 +129,21 @@ const EARLY_SCAN_WINDOW_MS = 5 * 60 * 1000; // safety scan on session open
 // submission window is still open (the link is still removed from the count).
 const WARN_ON_DELETE_DURING_SUBMISSION = true;
 
+// --- Deleted-link audit-log check ---
+const AUDIT_INITIAL_WAIT_MS = 2000; // audit entries can lag the delete event
+const AUDIT_RETRY_WAIT_MS = 1500; // one extra look before deciding "user deleted it"
+const AUDIT_FRESH_ENTRY_MS = 10 * 60 * 1000; // how recent an unseen audit entry must be
+
 // --- Cron ---
-const SESSION_1_CRON = '0 11 * * *'; // 11:00 AM
-const SESSION_2_CRON = '0 18 * * *'; // 6:00 PM
+const SESSION_1_TIME = { hour: 11, minute: 0 }; // 11:00 AM
+const SESSION_2_TIME = { hour: 18, minute: 0 }; // 6:00 PM
 const CRON_TIMEZONE = 'Asia/Karachi';
+// TIMING TOLERANCE: the cron tick may arrive up to 2 minutes (120000 ms) late
+// (server lag) and the session still starts. A tick later than that (process
+// asleep/stalled/restarted) means the session is SKIPPED and an error is logged.
+const CRON_MAX_LATENESS_MS = 120000;
+const MISSED_CHECK_INTERVAL_MS = 15 * 1000; // how often we look for a tick that never came
+const MISSED_LOG_WINDOW_MS = 10 * 60 * 1000; // only report a miss for 10 min after the time
 
 const GUIDE_COMMAND = '!GuideMeKucchi';
 
@@ -129,6 +162,48 @@ const sessions = new Map();
 const activeTrackedMessages = new Map();
 
 const SESSION_CHANNEL_IDS = new Set([MORNING_CHANNEL_ID, EVENING_CHANNEL_ID]);
+
+// Connection-watchdog coordination (see "Resilience" section)
+let criticalOps = 0; // raid open/close operations currently in flight
+let reconnecting = false; // watchdog is mid destroy()+login()
+let loginInProgress = false; // a login attempt/retry loop is running
+let lastGatewayEventAt = Date.now(); // last ready/disconnect/resume/reconnecting event
+let shuttingDown = false;
+
+/** Runs fn while marking a raid-critical operation as in flight (blocks forced reconnects). */
+async function runCritical(fn) {
+  criticalOps++;
+  try {
+    return await fn();
+  } finally {
+    criticalOps--;
+  }
+}
+
+// 'YYYY-MM-DD|Label' keys of sessions already handled today (started OR declared missed)
+const startedSessionKeys = new Set();
+
+// Audit-log bookkeeping: entryId -> how many deletions on that entry we've already attributed
+const auditClaimed = new Map();
+let auditCache = null; // { at, promise } — shares one fetch between near-simultaneous deletes
+
+// ----------------------------------------------------------------------------
+// Emoji self-correction
+// ----------------------------------------------------------------------------
+// On startup the bot asks Discord whether each custom emoji used in the message
+// templates is animated. A static-style tag (<:name:id>) on an animated emoji,
+// or the reverse, makes Discord show plain ":name:" text. verifiedEmojiAnimated
+// lets fixEmojiTags() rewrite the prefix correctly just before sending.
+
+const EMOJI_TAG_REGEX = /<(a?):(\w{2,32}):(\d{17,20})>/g;
+const verifiedEmojiAnimated = new Map(); // emojiId -> boolean
+
+function fixEmojiTags(text) {
+  return String(text).replace(EMOJI_TAG_REGEX, (full, _a, name, id) => {
+    if (!verifiedEmojiAnimated.has(id)) return full;
+    return `<${verifiedEmojiAnimated.get(id) ? 'a' : ''}:${name}:${id}>`;
+  });
+}
 
 // ----------------------------------------------------------------------------
 // Message templates
@@ -322,7 +397,7 @@ async function fetchNitterPage(handle, statusId) {
 
 /**
  * Heuristic: does this handle appear on the fetched Nitter page? This is a
- * plain text scan (no HTML parser, to stay light on Render's free tier), so
+ * plain text scan (no HTML parser, to stay light on small hosts), so
  * it can false-positive if the handle appears elsewhere on the page.
  */
 function pageMentionsHandle(pageText, handle) {
@@ -384,8 +459,9 @@ function trackReactions(session, messageId, userId) {
 client.on('messageReactionAdd', async (reaction, user) => {
   try {
     if (user.bot) return;
-    if (reaction.partial) await reaction.fetch();
-    if (reaction.message.partial) await reaction.message.fetch();
+    // No reaction.fetch()/message.fetch() here: everything we need (emoji id,
+    // message id, channel id) is present on partials, and fetching would cost
+    // 1-2 REST calls per reaction once message caches are trimmed.
 
     const channelId = reaction.message.channelId;
     if (!SESSION_CHANNEL_IDS.has(channelId)) return;
@@ -505,7 +581,7 @@ client.on('messageCreate', async (message) => {
 
       await message
         .reply({
-          content: buildGuideMessage(escapeMarkdown(rawName)),
+          content: fixEmojiTags(buildGuideMessage(escapeMarkdown(rawName))),
           // The name is plain text, so nobody is pinged (the staff roles show but don't ping).
           allowedMentions: { parse: [], repliedUser: false },
         })
@@ -553,7 +629,7 @@ async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
     const channel = await client.channels.fetch(channelId);
     if (!channel || !channel.isTextBased()) {
       console.error(`[openRaidSession] Could not resolve a text channel for ${sessionLabel}.`);
-      return;
+      return false;
     }
 
     console.log(`[openRaidSession] (${sessionLabel}) Opening submission phase.`);
@@ -576,6 +652,7 @@ async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
       processedMessageIds: new Set(),
       deletionWarned: new Set(), // userIds already warned for deleting a link this session
       closingMessage: null,
+      closeAt: null, // epoch ms when the submission window locks
       engagementLabel: null,
       timers: [],
     };
@@ -585,7 +662,7 @@ async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
     await setRolePermissions(channel, RAID_ROLE_ID, { view: true, send: true });
 
     await channel.send({
-      content: buildOpeningMessageFn(),
+      content: fixEmojiTags(buildOpeningMessageFn()),
       allowedMentions: { roles: [RAID_ROLE_ID] },
     });
 
@@ -595,18 +672,21 @@ async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
     await scanRecentSubmissions(session, channel);
 
     const openedSession = session;
+    openedSession.closeAt = Date.now() + SUBMISSION_DURATION_MS;
     scheduleForSession(
       openedSession,
       () => {
-        closeSubmissionChannel(openedSession).catch((err) => {
+        runCritical(() => closeSubmissionChannel(openedSession)).catch((err) => {
           console.error(`[closeSubmissionChannel] (${sessionLabel}) Unhandled error:`, err);
         });
       },
       SUBMISSION_DURATION_MS
     );
+    return true;
   } catch (err) {
     console.error(`[openRaidSession] (${sessionLabel}) Failed to open session:`, err);
     if (session && sessions.get(channelId) === session) endSession(session);
+    return false;
   }
 }
 
@@ -630,7 +710,7 @@ async function closeSubmissionChannel(session) {
   console.log(`[closeSubmissionChannel] (${session.label}) ${linkCount} link(s) submitted.`);
 
   session.closingMessage = await channel.send({
-    content: buildClosingMessage(linkCount, session.engagementLabel),
+    content: fixEmojiTags(buildClosingMessage(linkCount, session.engagementLabel)),
     allowedMentions: { parse: [] },
   });
 
@@ -653,10 +733,17 @@ async function refreshClosingMessage(session) {
   if (!session.closingMessage) return;
   try {
     await session.closingMessage.edit({
-      content: buildClosingMessage(session.participants.size, session.engagementLabel),
+      content: fixEmojiTags(
+        buildClosingMessage(session.participants.size, session.engagementLabel)
+      ),
       allowedMentions: { parse: [] },
     });
   } catch (err) {
+    if (err && err.code === 10008) {
+      // Closing message was deleted (e.g. by a purge bot) — nothing left to edit.
+      session.closingMessage = null;
+      return;
+    }
     console.error(`[closingMessage] (${session.label}) Could not update link count:`, err);
   }
 }
@@ -665,11 +752,87 @@ async function refreshClosingMessage(session) {
 // Deleted links
 // ----------------------------------------------------------------------------
 
+/** Shares one audit-log request between deletions that happen at about the same time. */
+function fetchRecentDeleteAuditEntries(guild) {
+  if (auditCache && Date.now() - auditCache.at < 1000) return auditCache.promise;
+
+  const promise = guild
+    .fetchAuditLogs({ type: AuditLogEvent.MessageDelete, limit: 50 })
+    .then((logs) => Array.from(logs.entries.values()));
+  const cacheEntry = { at: Date.now(), promise };
+  auditCache = cacheEntry;
+  promise.catch(() => {
+    if (auditCache === cacheEntry) auditCache = null;
+  });
+  return promise;
+}
+
+/**
+ * Looks for an audit entry showing that SOMEONE ELSE deleted this author's
+ * message in this channel. Discord aggregates repeat deletions into one entry
+ * with a growing `extra.count`, so each entry's count is "claimed" one deletion
+ * at a time (auditClaimed) — a second deletion by the same executor is still
+ * recognised, and old unrelated entries are never matched.
+ */
+function claimAuditEntry(entries, authorId, channelId) {
+  if (auditClaimed.size > 1000) auditClaimed.clear();
+
+  for (const entry of entries) {
+    if (!entry.target || entry.target.id !== authorId) continue;
+    if (!entry.extra || !entry.extra.channel || entry.extra.channel.id !== channelId) continue;
+    if (entry.executorId === authorId) continue; // defensive: author's own deletion
+
+    const total = (entry.extra && entry.extra.count) || 1;
+    const claimed = auditClaimed.get(entry.id);
+
+    if (claimed === undefined) {
+      // First time we see this entry: only trust it if it is recent.
+      auditClaimed.set(entry.id, total);
+      if (Date.now() - entry.createdTimestamp <= AUDIT_FRESH_ENTRY_MS) return entry;
+      continue;
+    }
+
+    if (claimed < total) {
+      auditClaimed.set(entry.id, claimed + 1);
+      return entry;
+    }
+  }
+  return null;
+}
+
+/**
+ * Decides who deleted a tracked link.
+ *   { type: 'other', executor } — a bot/moderator deleted it (audit entry found)
+ *   { type: 'self' }            — no audit entry: the author deleted it themselves
+ *   { type: 'unknown' }         — audit log unreadable: fail safe, do NOT warn
+ */
+async function findDeletionExecutor(guild, authorId, channelId) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await sleep(attempt === 0 ? AUDIT_INITIAL_WAIT_MS : AUDIT_RETRY_WAIT_MS);
+
+    let entries;
+    try {
+      entries = await fetchRecentDeleteAuditEntries(guild);
+    } catch (err) {
+      console.error(
+        '[audit] Could not read the audit log (bot needs the "View Audit Log" permission). Not warning.',
+        err && err.message
+      );
+      return { type: 'unknown' };
+    }
+
+    const hit = claimAuditEntry(entries, authorId, channelId);
+    if (hit) return { type: 'other', executor: hit.executor || null };
+  }
+  return { type: 'self' };
+}
+
 /**
  * Called when a tracked message is deleted. Works from the message id alone,
  * because deleted messages are frequently uncached (no author available).
+ * Warnings are only given when the AUTHOR deleted their own link.
  */
-async function handleDeletedLink(messageId) {
+async function handleDeletedLink(messageId, { bulk = false } = {}) {
   const channelId = activeTrackedMessages.get(messageId);
   if (!channelId) return;
 
@@ -686,22 +849,46 @@ async function handleDeletedLink(messageId) {
   session.reactions.delete(messageId);
   if (!entry) return; // superseded/untracked post — nothing to penalize
 
+  // The post is gone either way, so nobody can be expected to engage with it.
   removeParticipant(session, entry.userId);
   console.log(
-    `[deletedLink] (${session.label}) ${entry.userId} deleted their link — removed from session.`
+    `[deletedLink] (${session.label}) Link from ${entry.userId} was deleted — removed from session.`
   );
 
   // Keep the posted total in sync (only exists once the session has closed).
   await refreshClosingMessage(session);
 
-  // Penalize the deleter (once per session). Nobody else is affected: the
-  // post is gone from the session, so no one is checked against it.
+  // Bulk deletes are always a purge, never a member deleting their own link.
+  if (bulk) {
+    console.log(`[deletedLink] (${session.label}) Bulk delete (purge) — no warning for ${entry.userId}.`);
+    return;
+  }
+
   if (session.stage === 'submission' && !WARN_ON_DELETE_DURING_SUBMISSION) return;
   if (session.deletionWarned.has(entry.userId)) return;
-  session.deletionWarned.add(entry.userId);
+  session.deletionWarned.add(entry.userId); // reserve now so concurrent events can't double-warn
 
   try {
     const defaultersChannel = await client.channels.fetch(DEFAULTERS_CHANNEL_ID);
+    const verdict = await findDeletionExecutor(
+      defaultersChannel.guild,
+      entry.userId,
+      session.channelId
+    );
+
+    if (verdict.type !== 'self') {
+      session.deletionWarned.delete(entry.userId);
+      if (verdict.type === 'other') {
+        const who = verdict.executor
+          ? `${verdict.executor.tag || verdict.executor.id}${verdict.executor.bot ? ' (bot)' : ''}`
+          : 'another user/bot';
+        console.log(
+          `[deletedLink] (${session.label}) Deleted by ${who}, not by ${entry.userId} — no warning.`
+        );
+      }
+      return;
+    }
+
     const outcome = await applyWarning(defaultersChannel.guild, entry.userId);
 
     await defaultersChannel.send({
@@ -722,10 +909,11 @@ client.on('messageDelete', async (message) => {
   }
 });
 
+// Bulk deletes are purges: links are dropped from the session, nobody is warned.
 client.on('messageDeleteBulk', async (messages) => {
   try {
     for (const id of messages.keys()) {
-      await handleDeletedLink(id);
+      await handleDeletedLink(id, { bulk: true });
     }
   } catch (err) {
     console.error('[messageDeleteBulk] Failed to process deletions:', err);
@@ -771,7 +959,7 @@ async function pruneDeletedPosts(session) {
 
   for (const p of collectParticipantLinks(session)) {
     try {
-      await channel.messages.fetch(p.messageId);
+      await channel.messages.fetch(p.messageId, { force: true });
     } catch (err) {
       if (err && err.code === 10008) {
         console.warn(
@@ -868,7 +1056,7 @@ async function remindDefaulters(defaulterIds, channelId) {
   }
 
   await channel.send({
-    content: buildSoftReminderMessage(defaulterIds),
+    content: fixEmojiTags(buildSoftReminderMessage(defaulterIds)),
     allowedMentions: { users: defaulterIds },
   });
 }
@@ -971,7 +1159,7 @@ async function runFinalCheck(session) {
 
     if (outcomes.length > 0) {
       await channel.send({
-        content: buildFinalWarningMessage(session.label, outcomes),
+        content: fixEmojiTags(buildFinalWarningMessage(session.label, outcomes)),
         allowedMentions: { users: outcomes.map((o) => o.userId) },
       });
     }
@@ -1038,62 +1226,515 @@ async function setupDefaultersChannelPermissions() {
 }
 
 // ----------------------------------------------------------------------------
-// Scheduling
+// Scheduling (node-cron, strict exact-time starts — never late)
 // ----------------------------------------------------------------------------
 
+const SESSION_JOBS = [
+  {
+    label: 'Morning',
+    channelId: MORNING_CHANNEL_ID,
+    ...SESSION_1_TIME,
+    buildMessage: buildMorningOpeningMessage,
+  },
+  {
+    label: 'Evening',
+    channelId: EVENING_CHANNEL_ID,
+    ...SESSION_2_TIME,
+    buildMessage: buildEveningOpeningMessage,
+  },
+];
+
+/** Current date + time-of-day in the bot's timezone (Asia/Karachi). */
+function getZonedNow() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: CRON_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const get = (type) => Number(parts.find((p) => p.type === type).value);
+  const pad = (n) => String(n).padStart(2, '0');
+  const hour = get('hour');
+  const minute = get('minute');
+  const second = get('second');
+  return {
+    dateKey: `${get('year')}-${pad(get('month'))}-${pad(get('day'))}`,
+    minutesOfDay: hour * 60 + minute,
+    // Milliseconds are timezone-independent (offsets are whole minutes).
+    msOfDay: (hour * 3600 + minute * 60 + second) * 1000 + new Date().getMilliseconds(),
+  };
+}
+
+function scheduledMs(job) {
+  return (job.hour * 60 + job.minute) * 60 * 1000;
+}
+
+function formatJobTime(job) {
+  return `${String(job.hour).padStart(2, '0')}:${String(job.minute).padStart(2, '0')}`;
+}
+
+function describeTimeUntil(job) {
+  const { minutesOfDay } = getZonedNow();
+  const diff = (job.hour * 60 + job.minute - minutesOfDay + 1440) % 1440;
+  if (diff === 0) return 'now';
+  return `${Math.floor(diff / 60)}h ${diff % 60}m`;
+}
+
+function logMissedSession(job, lateMs) {
+  console.error(
+    `[cron] Missed exact time for ${job.label} Session! (scheduled ${formatJobTime(job)} ${CRON_TIMEZONE}, ${(lateMs / 1000).toFixed(1)}s late) — NOT starting it late.`
+  );
+}
+
+/**
+ * Called by the cron tick. Starts the session ONLY if the tick arrives on time
+ * (within CRON_MAX_LATENESS_MS of the exact scheduled time); otherwise it logs
+ * a strict error and skips the session. Each session is handled once per day.
+ */
+async function triggerSession(job) {
+  const { dateKey, msOfDay } = getZonedNow();
+  const key = `${dateKey}|${job.label}`;
+
+  if (startedSessionKeys.has(key)) {
+    console.log(`[cron] ${job.label} session already handled today — skipping.`);
+    return;
+  }
+
+  for (const k of startedSessionKeys) {
+    if (!k.startsWith(dateKey)) startedSessionKeys.delete(k); // drop yesterday's keys
+  }
+  startedSessionKeys.add(key);
+
+  const lateMs = msOfDay - scheduledMs(job);
+  if (lateMs > CRON_MAX_LATENESS_MS) {
+    logMissedSession(job, lateMs);
+    return;
+  }
+
+  console.log(`[cron] Triggering ${job.label} session (${formatJobTime(job)} ${CRON_TIMEZONE}).`);
+
+  if (reconnecting || loginInProgress || !client.isReady()) {
+    console.warn(`[cron] ${job.label}: Discord connection is not ready at session time — attempting to open anyway.`);
+  }
+
+  const opened = await runCritical(() =>
+    openRaidSession(job.channelId, job.label, job.buildMessage)
+  );
+  if (!opened) {
+    console.error(`[cron] ${job.label} session FAILED to open (see errors above) — not retrying, to avoid a late start.`);
+  }
+}
+
+/**
+ * Detects a cron tick that never arrived (e.g. the process was frozen at the
+ * scheduled time). It ONLY reports — it never starts a session.
+ */
+function runMissedCheck() {
+  try {
+    const { dateKey, msOfDay } = getZonedNow();
+
+    for (const job of SESSION_JOBS) {
+      const sinceMs = msOfDay - scheduledMs(job);
+      if (sinceMs <= CRON_MAX_LATENESS_MS || sinceMs > MISSED_LOG_WINDOW_MS) continue;
+
+      const key = `${dateKey}|${job.label}`;
+      if (startedSessionKeys.has(key)) continue; // started, or already reported
+
+      startedSessionKeys.add(key);
+      logMissedSession(job, sinceMs);
+    }
+  } catch (err) {
+    console.error('[cron] Missed-session check failed:', err);
+  }
+}
+
+let cronScheduled = false;
+
 function scheduleRaidSessions() {
-  cron.schedule(
-    SESSION_1_CRON,
-    () => {
-      console.log('[cron] Triggering Session 1 (11:00 AM Asia/Karachi) — Morning channel.');
-      openRaidSession(MORNING_CHANNEL_ID, 'Morning', buildMorningOpeningMessage);
-    },
-    { timezone: CRON_TIMEZONE }
-  );
+  if (cronScheduled) return; // never register the same jobs twice
+  cronScheduled = true;
 
-  cron.schedule(
-    SESSION_2_CRON,
-    () => {
-      console.log('[cron] Triggering Session 2 (6:00 PM Asia/Karachi) — Evening channel.');
-      openRaidSession(EVENING_CHANNEL_ID, 'Evening', buildEveningOpeningMessage);
-    },
-    { timezone: CRON_TIMEZONE }
-  );
+  for (const job of SESSION_JOBS) {
+    const expression = `${job.minute} ${job.hour} * * *`;
+    try {
+      cron.schedule(
+        expression,
+        () => {
+          triggerSession(job).catch((err) => {
+            console.error(`[cron] ${job.label} trigger crashed:`, err);
+          });
+        },
+        { timezone: CRON_TIMEZONE }
+      );
+      console.log(
+        `[cron] ✅ Scheduled ${job.label} session "${expression}" (${CRON_TIMEZONE}) at ${new Date().toISOString()} — next run in ${describeTimeUntil(job)}.`
+      );
+    } catch (err) {
+      console.error(`[cron] ❌ Failed to schedule ${job.label} session:`, err);
+    }
+  }
 
-  console.log(`[cron] Scheduled Morning 11:00 AM and Evening 6:00 PM (${CRON_TIMEZONE}).`);
+  setInterval(runMissedCheck, MISSED_CHECK_INTERVAL_MS);
+  console.log(
+    `[cron] Timing guard ON: a session starts only if its cron tick arrives within ${CRON_MAX_LATENESS_MS / 1000}s of the exact time; later than that it is logged as missed and skipped.`
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Startup checks (audit-log permission + custom emoji verification)
+// ----------------------------------------------------------------------------
+
+async function verifyEmojis(guild) {
+  const sample = [
+    buildMorningOpeningMessage(),
+    buildEveningOpeningMessage(),
+    buildClosingMessage(0, '1 Hour'),
+    buildSoftReminderMessage([]),
+    buildFinalWarningMessage('Morning', []),
+    buildGuideMessage('x'),
+  ].join('\n');
+
+  const found = new Map();
+  for (const match of sample.matchAll(EMOJI_TAG_REGEX)) {
+    const [, a, name, id] = match;
+    if (!found.has(id)) found.set(id, { name, writtenAnimated: a === 'a' });
+  }
+
+  for (const [id, info] of found) {
+    try {
+      const emoji = await guild.emojis.fetch(id);
+      const animated = Boolean(emoji.animated);
+      verifiedEmojiAnimated.set(id, animated);
+      if (animated !== info.writtenAnimated) {
+        console.warn(
+          `[emoji] ${info.name}:${id} is ${animated ? 'ANIMATED' : 'STATIC'} but the code writes it as ${info.writtenAnimated ? 'animated (<a:)' : 'static (<:)'} — auto-correcting when sending.`
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[emoji] ${info.name}:${id} was NOT found in this server (wrong/deleted ID, or it lives in another server) — it will show as plain text.`
+      );
+    }
+  }
+
+  console.log(`[emoji] Checked ${found.size} custom emoji(s).`);
+}
+
+async function runStartupChecks() {
+  try {
+    const channel = await client.channels.fetch(DEFAULTERS_CHANNEL_ID);
+    const guild = channel.guild;
+
+    const me = guild.members.me || (await guild.members.fetchMe());
+    if (me.permissions.has(PermissionFlagsBits.ViewAuditLog)) {
+      console.log('[setup] View Audit Log permission OK.');
+    } else {
+      console.error(
+        '[setup] ❌ Bot is missing the "View Audit Log" permission — deleted-link warnings are DISABLED (fail-safe) until it is granted.'
+      );
+    }
+
+    await verifyEmojis(guild);
+  } catch (err) {
+    console.error('[setup] Startup checks failed:', err);
+  }
 }
 
 // ----------------------------------------------------------------------------
 // Startup
 // ----------------------------------------------------------------------------
 
-client.once('ready', () => {
+/** Confirms the cron timezone is what we think it is, independent of the server's clock. */
+function logSystemInfo() {
+  try {
+    const serverTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const karachiNow = new Intl.DateTimeFormat('en-GB', {
+      timeZone: CRON_TIMEZONE,
+      dateStyle: 'medium',
+      timeStyle: 'medium',
+      hourCycle: 'h23',
+    }).format(new Date());
+
+    console.log(
+      `[system] Boot at ${new Date().toISOString()} (UTC) | Node ${process.version} | server timezone: ${serverTz}${process.env.TZ ? ` (TZ=${process.env.TZ})` : ''}`
+    );
+    console.log(
+      `[system] Cron + session timing are locked to ${CRON_TIMEZONE} — time there right now: ${karachiNow}. The server's own timezone is never used.`
+    );
+    for (const job of SESSION_JOBS) {
+      console.log(`[system] ${job.label} session: ${formatJobTime(job)} ${CRON_TIMEZONE}, next in ${describeTimeUntil(job)}.`);
+    }
+  } catch (err) {
+    console.error(`[system] ❌ Timezone "${CRON_TIMEZONE}" is not usable on this host — sessions will NOT run correctly:`, err);
+  }
+}
+
+// Gateway connection visibility: discord.js reconnects on its own; these logs
+// show when the connection dropped and came back.
+client.on(Events.ShardDisconnect, (event, shardId) => {
+  console.warn(`[system] Discord connection lost (shard ${shardId}, code ${event && event.code}) — reconnecting automatically.`);
+});
+client.on(Events.ShardReconnecting, (shardId) => {
+  console.warn(`[system] Reconnecting to Discord (shard ${shardId})...`);
+});
+client.on(Events.ShardResume, (shardId, replayedEvents) => {
+  console.log(`[system] Discord connection resumed (shard ${shardId}, ${replayedEvents} event(s) replayed).`);
+});
+client.on(Events.Error, (err) => {
+  console.error('[system] Discord client error:', err);
+});
+client.on(Events.ShardError, (err, shardId) => {
+  console.error(`[system] Discord shard ${shardId} error:`, err);
+});
+
+// Remember when the gateway last did something, so the watchdog never
+// "rescues" a connection that is in the middle of reconnecting by itself.
+for (const evt of [
+  Events.ClientReady,
+  Events.ShardDisconnect,
+  Events.ShardReconnecting,
+  Events.ShardResume,
+]) {
+  client.on(evt, () => {
+    lastGatewayEventAt = Date.now();
+  });
+}
+
+let readyCount = 0;
+client.on(Events.ClientReady, () => {
+  readyCount++;
+  if (readyCount > 1) {
+    console.log(`[system] ✅ Back online as ${client.user.tag} (reconnect #${readyCount - 1}). Cron jobs were never stopped.`);
+  }
+});
+
+client.once(Events.ClientReady, () => {
   console.log(`[bot] Logged in as ${client.user.tag}.`);
+  scheduleRaidSessions(); // first, so setup problems can never block the schedule
   setupDefaultersChannelPermissions();
-  scheduleRaidSessions();
+  runStartupChecks();
 });
 
 if (!DISCORD_TOKEN) {
-  console.error('[bot] DISCORD_TOKEN is not set in your .env file. Cannot start the bot.');
+  console.error('[bot] DISCORD_TOKEN is not set in your environment variables. Cannot start the bot.');
   process.exit(1);
 }
 
+logSystemInfo();
+
 // ----------------------------------------------------------------------------
-// Keep-alive HTTP server (for Render)
+// Keep-alive / health HTTP server (Docker / Kerit Cloud)
+// ----------------------------------------------------------------------------
+//   GET /        -> 200 "Bot is running!"  (the process is alive)
+//   GET /health  -> 200 JSON when connected to Discord, 503 while it is not
+// Binds to 0.0.0.0 so the container's port mapping / health checks can reach it
+// (binding to localhost only would be invisible from outside the container).
+
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = '0.0.0.0';
+
+const server = http.createServer((req, res) => {
+  const path = String(req.url || '/').split('?')[0];
+
+  if (path === '/health') {
+    const ready = client.isReady();
+    res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        status: ready ? 'ok' : 'connecting',
+        uptimeSeconds: Math.round(process.uptime()),
+        discordPingMs: ready ? client.ws.ping : null,
+        activeSessions: sessions.size,
+      })
+    );
+    return;
+  }
+
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is running!');
+});
+
+server.on('error', (err) => {
+  console.error(`[http] Server error on ${HOST}:${PORT}:`, err);
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[http] Keep-alive server listening on ${HOST}:${PORT} (GET / and GET /health)`);
+});
+
+// ----------------------------------------------------------------------------
+// Process lifecycle (Docker sends SIGTERM when it stops/restarts the container)
 // ----------------------------------------------------------------------------
 
-const PORT = process.env.PORT || 3000;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[system] Received ${signal} — container is stopping. Any session in progress will be lost.`);
+  try {
+    server.close();
+    client.destroy();
+  } catch (err) {
+    console.error('[system] Error during shutdown:', err);
+  }
+  setTimeout(() => process.exit(0), 1000).unref();
+}
 
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is running!');
-  })
-  .listen(PORT, () => {
-    console.log(`[http] Keep-alive server running on port ${PORT}`);
-  });
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
-client.login(DISCORD_TOKEN).catch((err) => {
-  console.error('[bot] Failed to log in. Check that DISCORD_TOKEN is correct.', err);
-  process.exit(1);
+// ----------------------------------------------------------------------------
+// Resilience: login retry, connection watchdog, memory trimming
+// ----------------------------------------------------------------------------
+
+const CONNECTION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const RECONNECT_GRACE_MS = 60 * 1000; // let discord.js' own reconnect finish first
+const CRITICAL_WINDOW_MS = 30 * 1000; // no forced reconnect this close to a raid open/close
+const MEMORY_CLEAN_INTERVAL_MS = 15 * 60 * 1000;
+
+function isFatalLoginError(err) {
+  const text = `${err && err.code} ${err && err.message}`;
+  return (
+    (err && (err.code === DiscordjsErrorCodes.TokenInvalid || err.code === DiscordjsErrorCodes.DisallowedIntents)) ||
+    /invalid token|disallowed intents/i.test(text)
+  );
+}
+
+/**
+ * Logs in, retrying with backoff (5s, 10s ... max 60s) on transient failures
+ * such as a network blip. Returns false only for errors that can never fix
+ * themselves (invalid token / privileged intents not enabled).
+ */
+async function loginWithRetry(reason) {
+  loginInProgress = true;
+  let delay = 5000;
+  try {
+    for (let attempt = 1; !shuttingDown; attempt++) {
+      try {
+        await client.login(DISCORD_TOKEN);
+        console.log(`[system] Discord login OK (${reason}, attempt ${attempt}).`);
+        return true;
+      } catch (err) {
+        console.error(`[system] Discord login failed (${reason}, attempt ${attempt}):`, err && err.message);
+        if (isFatalLoginError(err)) {
+          console.error('[system] ❌ This error cannot fix itself — check DISCORD_TOKEN and the Message Content intent in the Developer Portal.');
+          return false;
+        }
+        await sleep(delay);
+        delay = Math.min(delay * 2, 60 * 1000);
+      }
+    }
+    return false;
+  } finally {
+    loginInProgress = false;
+  }
+}
+
+/** True when a forced reconnect right now could break a raid session opening or locking. */
+function isCriticalMoment() {
+  if (criticalOps > 0) return true;
+
+  const { msOfDay } = getZonedNow();
+  for (const job of SESSION_JOBS) {
+    if (Math.abs(msOfDay - scheduledMs(job)) <= CRITICAL_WINDOW_MS) return true;
+  }
+
+  const now = Date.now();
+  for (const session of sessions.values()) {
+    if (session.stage === 'submission' && session.closeAt && Math.abs(now - session.closeAt) <= CRITICAL_WINDOW_MS) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Connection watchdog (runs every 5 minutes). If the bot is not connected to
+ * Discord, it tears the client down and logs back in. It never touches the
+ * cron jobs (they are plain timers and keep running), and it holds off while a
+ * raid session is opening/locking so it cannot break one mid-flight.
+ */
+async function checkConnection() {
+  if (shuttingDown || reconnecting || loginInProgress) return;
+
+  const healthy = client.isReady() && client.ws.ping !== -1;
+  if (healthy) return;
+
+  if (Date.now() - lastGatewayEventAt < RECONNECT_GRACE_MS) {
+    console.log('[watchdog] Connection looks unhealthy but the gateway was active <60s ago — giving it time to recover on its own.');
+    return;
+  }
+
+  if (isCriticalMoment()) {
+    console.warn('[watchdog] Connection lost, but a raid session is opening/locking right now — postponing the reconnect to the next check.');
+    return;
+  }
+
+  reconnecting = true;
+  try {
+    console.error('[watchdog] Connection lost, forcing reconnect...');
+    await client.destroy();
+    await loginWithRetry('watchdog reconnect');
+  } catch (err) {
+    console.error('[watchdog] Reconnect attempt failed:', err);
+  } finally {
+    reconnecting = false;
+    lastGatewayEventAt = Date.now();
+  }
+}
+
+/**
+ * Trims discord.js caches to stay inside a small RAM limit (256 MB).
+ * Safe for the raid logic: sessions keep their own data (participants,
+ * reactions, the closing-message object), message/member lookups fall back to
+ * the API, and the bot's own member is kept so permission checks keep working.
+ */
+function clearCaches() {
+  let membersRemoved = 0;
+  let channelCaches = 0;
+
+  for (const guild of client.guilds.cache.values()) {
+    const botId = client.user && client.user.id;
+    membersRemoved += guild.members.cache.sweep((member) => member.id !== botId);
+
+    for (const channel of guild.channels.cache.values()) {
+      // Categories / forums have no message cache.
+      if (channel.messages && channel.messages.cache) {
+        channel.messages.cache.clear();
+        channelCaches++;
+      }
+    }
+  }
+
+  const mem = process.memoryUsage();
+  const mb = (n) => (n / 1024 / 1024).toFixed(0);
+  console.log(
+    `[memory] Cleared ${membersRemoved} cached member(s) and ${channelCaches} channel message cache(s) | RSS ${mb(mem.rss)} MB, heap ${mb(mem.heapUsed)} MB`
+  );
+  if (mem.rss > 200 * 1024 * 1024) {
+    console.warn(`[memory] ⚠️ RSS is ${mb(mem.rss)} MB — close to the 256 MB limit.`);
+  }
+}
+
+setInterval(() => {
+  checkConnection().catch((err) => console.error('[watchdog] Unexpected error:', err));
+}, CONNECTION_CHECK_INTERVAL_MS);
+
+setInterval(() => {
+  try {
+    clearCaches();
+  } catch (err) {
+    console.error('[memory] Cache cleanup failed:', err);
+  }
+}, MEMORY_CLEAN_INTERVAL_MS);
+
+console.log(
+  `[system] Safety nets active: connection watchdog every ${CONNECTION_CHECK_INTERVAL_MS / 60000} min, memory cleanup every ${MEMORY_CLEAN_INTERVAL_MS / 60000} min, global error handlers.`
+);
+
+loginWithRetry('startup').then((ok) => {
+  if (!ok) process.exit(1); // unrecoverable config problem — nothing left to retry
 });
