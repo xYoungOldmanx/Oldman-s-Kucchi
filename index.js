@@ -14,6 +14,15 @@
 //   - "Didn't complete engagement"
 //   - "Deleted the link" (deleting a submitted link during an active session)
 //
+// Link rules (submission phase):
+//   - A link must be exactly https://x.com/<handle>/status/<id> (or twitter.com).
+//     Anything else (tracking IDs like ?s=20, wrong format) is deleted silently —
+//     NO warning — and the member is told in the defaulters channel.
+//   - When a member gets the 7-day timeout, their X handle is saved to
+//     banned_handles.json and cannot be submitted by any other Discord account.
+//   - Every hour (and on !checkTimeouts) members whose timeout has ended get both
+//     warning roles removed and their handle released.
+//
 // IMPORTANT CAVEATS (read before relying on this in production):
 //
 // - Reply verification uses Nitter, a free unofficial mirror of X. Public
@@ -48,7 +57,7 @@ const {
   GatewayIntentBits,
   Partials,
   Options,
-  escapeMarkdown,
+  MessageFlags,
   AuditLogEvent,
   PermissionFlagsBits,
   Events,
@@ -56,6 +65,8 @@ const {
 } = require('discord.js');
 const cron = require('node-cron');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 // ----------------------------------------------------------------------------
 // Global error handlers — log and keep running (never exit on a stray error)
@@ -91,6 +102,18 @@ const STAFF_USER_IDS = [
   '1337547099448938649', // Co-founder 2
 ];
 
+// --- Owner (only this account may use !banx / !unbanx / !checkTimeouts) ---
+const OWNER_USER_IDS = new Set([STAFF_USER_IDS[0]]); // 'Server owner'
+
+// --- Link validation / alt-account blocking ---
+// Set BANNED_HANDLES_PATH to a persistent volume if your host wipes the container disk on restart.
+const BANNED_HANDLES_FILE =
+  process.env.BANNED_HANDLES_PATH || path.join(__dirname, 'banned_handles.json');
+const NOTICE_COOLDOWN_MS = 20 * 1000; // max one "wrong link"/"banned" notice per member per 20 s
+
+// --- Timeout expiry cleanup ---
+const TIMEOUT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // hourly
+
 // --- Tracked emoji (the ONLY reaction allowed on participant posts) ---
 const TRACKED_EMOJI_ID = '1558278278089936996';
 const TRACKED_EMOJI_NAME = 'Kucchi';
@@ -101,7 +124,7 @@ const TRACKED_EMOJI_REACTION = `${TRACKED_EMOJI_NAME}:${TRACKED_EMOJI_ID}`;
 // --- Other custom emojis used in message templates ---
 const EMOJI_BACK = '<a:Kucchi:1558273201027678208>';
 const EMOJI_DEADLINE = '<a:Kucchi:1558279883107606558>';
-const EMOJI_HAPPY = '<a:Kucchi:1558392258749800480>';
+const EMOJI_HAPPY = '<a:Kucchi:1558318070160687196>';
 const EMOJI_EDIT_WARNING = '<a:Kucchi:1559516166144401488>';
 const EMOJI_DOUBLE_CHECK = '<a:Kucchi:1558341990129598464>';
 
@@ -147,8 +170,13 @@ const MISSED_LOG_WINDOW_MS = 10 * 60 * 1000; // only report a miss for 10 min af
 
 const GUIDE_COMMAND = '!GuideMeKucchi';
 
-const TWITTER_LINK_REGEX =
-  /(?:https?:\/\/)?(?:www\.)?(?:twitter\.com|x\.com)\/([A-Za-z0-9_]{1,15})\/status(?:es)?\/(\d+)/i;
+// Any X/Twitter URL inside a message. The scheme/www are optional so "x.com/..." is still
+// caught; the lookbehind stops "box.com/..." from matching.
+const X_URL_CANDIDATE_REGEX =
+  /(?<![A-Za-z0-9_.-])(?:https?:\/\/)?(?:www\.|mobile\.)?(?:twitter\.com|x\.com)\/[^\s<>|]+/i;
+// The ONLY accepted shape: https://x.com/<handle>/status/<id> (twitter.com too).
+const X_URL_VALID_REGEX =
+  /^https:\/\/(?:www\.)?(?:twitter\.com|x\.com)\/([A-Za-z0-9_]{1,15})\/status\/(\d+)\/?$/i;
 
 // ----------------------------------------------------------------------------
 // In-memory state
@@ -169,6 +197,8 @@ let reconnecting = false; // watchdog is mid destroy()+login()
 let loginInProgress = false; // a login attempt/retry loop is running
 let lastGatewayEventAt = Date.now(); // last ready/disconnect/resume/reconnecting event
 let shuttingDown = false;
+let cleanupRunning = false; // timeout cleanup is currently running
+let memberListWarned = false; // only warn once if members can't be listed
 
 /** Runs fn while marking a raid-critical operation as in flight (blocks forced reconnects). */
 async function runCritical(fn) {
@@ -247,10 +277,10 @@ function buildClosingMessage(linkCount, withinWindow) {
   );
 }
 
-/** Reply for the !GuideMeKucchi command. displayName is inserted as plain text. */
-function buildGuideMessage(displayName) {
+/** Reply for the !GuideMeKucchi command. userMention is a real mention, e.g. <@123>. */
+function buildGuideMessage(userMention) {
   return (
-    `Yoo fella ${displayName} Welcome to the server <a:Kucchi:1558444604129280101>\n` +
+    `Yoo fella ${userMention} Welcome to the server <a:Kucchi:1558444604129280101>\n` +
     `\n` +
     `Explore OMC https://discord.com/channels/1343701000174698602/1459852660780961824 <a:Kucchi:1558278278089936996>\n` +
     `\n` +
@@ -298,6 +328,21 @@ function buildDeletedLinkMessage(userId, label) {
   return `⚠️ <@${userId}> has received ${label} for: ${REASON_DELETED_LINK}`;
 }
 
+/** Posted in the defaulters channel when a submitted link has the wrong format / a tracking ID. */
+function buildWrongLinkMessage(userId) {
+  return (
+    `<@${userId}> Yoo fella kindly correct your x link format and remove tracking ID from your link and then drop your link again in the session <a:Kucchi:1558341990129598464>\n` +
+    `How to remove Tracking ID: Just simply remove everything from the end of your link till **?** <a:Kucchi:1558341684587397231>\n` +
+    `Correct Format Link Ex: <https://x.com/xYoungOldmanx/status/2122389495505199152> <a:Kucchi:1558279158449053697>\n` +
+    `Wrong Format Of Link Ex: <https://x.com/xYoungOldmanx/status/2122389495505199152?a=DlZF4qtOgFBcyBcp9Bo&s=20> <a:Kucchi:1572727619693318186>`
+  );
+}
+
+/** Posted in the defaulters channel when someone submits the X account of a timed-out member. */
+function buildBannedAltMessage(userId) {
+  return `⚠️ <@${userId}>, this X account is currently serving a 7-day timeout. You cannot participate until it ends. <a:Kucchi:1558341684587397231>`;
+}
+
 // ----------------------------------------------------------------------------
 // Discord client
 // ----------------------------------------------------------------------------
@@ -329,10 +374,23 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function parseTwitterLink(content) {
-  const match = String(content || '').match(TWITTER_LINK_REGEX);
-  if (!match) return null;
-  return { handle: match[1], statusId: match[2] };
+/**
+ * Classifies the first X/Twitter URL in a message:
+ *   { kind: 'none' }                              — no X/Twitter link at all
+ *   { kind: 'wrong', token }                      — an X link that is NOT exactly
+ *                                                   https://x.com/<handle>/status/<id>
+ *                                                   (tracking IDs like ?s=20, http://, extra paths...)
+ *   { kind: 'valid', handle, statusId, link }     — correct format
+ */
+function analyzeSubmissionLink(content) {
+  const match = String(content || '').match(X_URL_CANDIDATE_REGEX);
+  if (!match) return { kind: 'none' };
+
+  // Sentence punctuation right after a link is not part of it ("...status/123.")
+  const token = match[0].replace(/[.,;:!)\]]+$/, '');
+  const valid = token.match(X_URL_VALID_REGEX);
+  if (!valid) return { kind: 'wrong', token };
+  return { kind: 'valid', handle: valid[1], statusId: valid[2], link: token };
 }
 
 async function setRolePermissions(channel, roleId, { view, send }) {
@@ -364,6 +422,108 @@ function removeParticipant(session, userId) {
   activeTrackedMessages.delete(entry.messageId);
   session.reactions.delete(entry.messageId);
   return entry;
+}
+
+// ----------------------------------------------------------------------------
+// Banned X handles (alt-account blocking) — persisted in banned_handles.json
+// ----------------------------------------------------------------------------
+// File format: [{ "discordId": "123", "xHandle": "SomeHandle", "timeoutUntil": 1760000000000 }]
+// timeoutUntil (epoch ms) is added automatically when the bot issues the timeout. Discord can
+// report "no timeout" once it has expired, so this record is how expiry is still known later.
+// Manual entries made with !banx get it too when the member is timed out at that moment.
+
+let bannedHandles = []; // in-memory copy; every change is written through to the file
+let bannedWriteChain = Promise.resolve(); // serialises file writes
+
+function normalizeBanEntry(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const discordId = String(raw.discordId || '').trim();
+  const xHandle = String(raw.xHandle || '').trim().replace(/^@/, '');
+  if (!/^\d{1,25}$/.test(discordId) || !/^[A-Za-z0-9_]{1,15}$/.test(xHandle)) return null;
+  const entry = { discordId, xHandle };
+  if (Number.isFinite(raw.timeoutUntil)) entry.timeoutUntil = raw.timeoutUntil;
+  return entry;
+}
+
+function loadBannedHandles() {
+  try {
+    if (!fs.existsSync(BANNED_HANDLES_FILE)) {
+      bannedHandles = [];
+      console.log(`[banlist] No ${path.basename(BANNED_HANDLES_FILE)} yet — starting with an empty list.`);
+      return;
+    }
+    const parsed = JSON.parse(fs.readFileSync(BANNED_HANDLES_FILE, 'utf8'));
+    if (!Array.isArray(parsed)) throw new Error('file is not a JSON array');
+    bannedHandles = parsed.map(normalizeBanEntry).filter(Boolean);
+    console.log(`[banlist] Loaded ${bannedHandles.length} banned X handle(s) from ${BANNED_HANDLES_FILE}.`);
+  } catch (err) {
+    console.error(`[banlist] Could not read ${BANNED_HANDLES_FILE}:`, err && err.message);
+    try {
+      const backup = `${BANNED_HANDLES_FILE}.corrupt-${Date.now()}`;
+      fs.renameSync(BANNED_HANDLES_FILE, backup);
+      console.error(`[banlist] Unreadable file moved to ${backup}; starting with an empty list.`);
+    } catch (renameErr) {
+      /* nothing to move */
+    }
+    bannedHandles = [];
+  }
+}
+
+/** Writes the list to disk (temp file + rename, so a crash can't leave half a file). */
+function saveBannedHandles() {
+  const snapshot = JSON.stringify(bannedHandles, null, 2);
+  bannedWriteChain = bannedWriteChain
+    .then(async () => {
+      const tmp = `${BANNED_HANDLES_FILE}.tmp`;
+      await fs.promises.writeFile(tmp, snapshot, 'utf8');
+      await fs.promises.rename(tmp, BANNED_HANDLES_FILE);
+    })
+    .catch((err) => console.error('[banlist] Failed to save banned_handles.json:', err));
+  return bannedWriteChain;
+}
+
+/** Returns the ban entry for this X handle if it is still in force (case-insensitive). */
+function findActiveBan(xHandle) {
+  const needle = String(xHandle || '').toLowerCase();
+  const now = Date.now();
+  return (
+    bannedHandles.find(
+      (e) => e.xHandle.toLowerCase() === needle && (!e.timeoutUntil || e.timeoutUntil > now)
+    ) || null
+  );
+}
+
+/** One entry per Discord ID: a repeat ban replaces the old one. */
+async function addBannedHandle(discordId, xHandle, timeoutUntil = null) {
+  const entry = normalizeBanEntry({ discordId, xHandle, timeoutUntil });
+  if (!entry) throw new Error('invalid discordId or xHandle');
+  bannedHandles = bannedHandles.filter((e) => e.discordId !== entry.discordId);
+  bannedHandles.push(entry);
+  await saveBannedHandles();
+  return entry;
+}
+
+/** Removes every entry for this Discord ID; returns the removed entries. */
+async function removeBannedHandle(discordId) {
+  const removed = bannedHandles.filter((e) => e.discordId === String(discordId));
+  if (removed.length === 0) return [];
+  bannedHandles = bannedHandles.filter((e) => e.discordId !== String(discordId));
+  await saveBannedHandles();
+  return removed;
+}
+
+/** Called right after the bot gave someone the 7-day timeout. */
+async function recordTimeoutBan(userId, xHandle, timeoutUntil) {
+  if (!xHandle) {
+    console.warn(`[banlist] ${userId} was timed out but no X handle is known — nothing to ban.`);
+    return;
+  }
+  try {
+    await addBannedHandle(userId, xHandle, timeoutUntil);
+    console.log(`[banlist] Banned X handle @${xHandle} for ${userId} until ${new Date(timeoutUntil).toISOString()}.`);
+  } catch (err) {
+    console.error(`[banlist] Could not record ban for ${userId}:`, err);
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -521,6 +681,42 @@ async function reactToSubmission(message) {
   return false;
 }
 
+/** Deletes a rejected submission. This is a cleanup, never a "deleted the link" violation. */
+async function deleteRejectedMessage(message) {
+  try {
+    await message.delete();
+  } catch (err) {
+    if (err && err.code === 10008) return; // already gone
+    console.error('[submission] Could not delete rejected message (needs Manage Messages):', err);
+  }
+}
+
+/**
+ * Rejects a submission: deletes it right away, never counts it, and (at most once per
+ * NOTICE_COOLDOWN_MS per member) posts the notice in the defaulters channel with a real
+ * ping. The message was never registered in activeTrackedMessages, so the deletion
+ * cannot reach the warning system.
+ */
+async function rejectSubmission(session, message, noticeText) {
+  await deleteRejectedMessage(message);
+
+  const userId = message.author.id;
+  const last = session.noticeAt.get(userId) || 0;
+  if (Date.now() - last < NOTICE_COOLDOWN_MS) return;
+  session.noticeAt.set(userId, Date.now());
+
+  try {
+    const channel = await client.channels.fetch(DEFAULTERS_CHANNEL_ID);
+    await channel.send({
+      content: fixEmojiTags(noticeText),
+      allowedMentions: { users: [userId] },
+      flags: MessageFlags.SuppressEmbeds,
+    });
+  } catch (err) {
+    console.error(`[submission] Could not post the notice for ${userId}:`, err);
+  }
+}
+
 /**
  * Handles one candidate submission message. Idempotent per message id, so it
  * is safe for both the live handler and the on-open safety scan to call it.
@@ -530,15 +726,35 @@ async function processSubmission(session, message) {
   session.processedMessageIds.add(message.id);
 
   const content = message.content || '';
-  const hasHttpLink = /https?:\/\//i.test(content);
+  const link = analyzeSubmissionLink(content);
 
+  // 1) Wrong format / tracking ID -> delete, don't count, tell the member (no warning).
+  if (link.kind === 'wrong') {
+    console.log(`[submission] (${session.label}) Wrong link format from ${message.author.id} — removed.`);
+    await rejectSubmission(session, message, buildWrongLinkMessage(message.author.id));
+    return;
+  }
+
+  // 2) Alt-account block: the X handle belongs to someone serving a 7-day timeout.
+  if (link.kind === 'valid') {
+    const ban = findActiveBan(link.handle);
+    if (ban) {
+      console.log(
+        `[submission] (${session.label}) @${link.handle} is banned (timed-out member ${ban.discordId}); ${message.author.id} tried to submit it — removed.`
+      );
+      await rejectSubmission(session, message, buildBannedAltMessage(message.author.id));
+      return;
+    }
+  }
+
+  // 3) Accepted. The bot reacts first so non-Nitro members can piggyback on its reaction.
+  const hasHttpLink = /https?:\/\//i.test(content);
   const isRaidMember = await memberHasRaidRole(message);
   if (isRaidMember && hasHttpLink) {
     await reactToSubmission(message);
   }
 
-  const parsed = parseTwitterLink(content);
-  if (!parsed) return; // not a valid X/Twitter status link — don't register as a submission
+  if (link.kind !== 'valid') return; // not an X link at all — don't register as a submission
 
   // The window may have closed while we were awaiting above.
   if (session.stage !== 'submission') return;
@@ -552,9 +768,9 @@ async function processSubmission(session, message) {
   }
 
   session.participants.set(message.author.id, {
-    handle: parsed.handle,
-    statusId: parsed.statusId,
-    link: content.trim(),
+    handle: link.handle,
+    statusId: link.statusId,
+    link: link.link,
     messageId: message.id,
   });
 
@@ -570,20 +786,20 @@ client.on('messageCreate', async (message) => {
     if (!message.guild) return;
     if (!message.author || message.author.bot) return;
 
+    // Owner-only commands (!banx, !unbanx, !checkTimeouts). Anyone else typing them is ignored.
+    if (await handleOwnerCommand(message)) return;
+
     // !GuideMeKucchi works ONLY in the Lounge channel; anywhere else it is ignored.
     if ((message.content || '').trim() === GUIDE_COMMAND) {
       if (message.channelId !== LOUNGE_CHANNEL_ID) return;
 
-      const rawName =
-        (message.member && message.member.displayName) ||
-        message.author.globalName ||
-        message.author.username;
+      // A real mention (not plain text) so the member actually gets notified.
+      const userMention = `<@${message.author.id}>`;
 
       await message
         .reply({
-          content: fixEmojiTags(buildGuideMessage(escapeMarkdown(rawName))),
-          // The name is plain text, so nobody is pinged (the staff roles show but don't ping).
-          allowedMentions: { parse: [], repliedUser: false },
+          content: fixEmojiTags(buildGuideMessage(userMention)),
+          allowedMentions: { users: [message.author.id], repliedUser: false },
         })
         .catch((err) => console.error('[guide] Failed to send guide message:', err));
       return;
@@ -604,7 +820,8 @@ client.on('messageCreate', async (message) => {
  */
 async function scanRecentSubmissions(session, channel) {
   try {
-    const cutoff = Date.now() - EARLY_SCAN_WINDOW_MS;
+    // Never look at messages from before this session existed: rejected links are deleted now.
+    const cutoff = Math.max(Date.now() - EARLY_SCAN_WINDOW_MS, session.startedAt - 1000);
     const fetched = await channel.messages.fetch({ limit: 50 });
     const recent = Array.from(fetched.values())
       .filter((m) => !m.author.bot && m.createdTimestamp >= cutoff)
@@ -653,6 +870,8 @@ async function openRaidSession(channelId, sessionLabel, buildOpeningMessageFn) {
       deletionWarned: new Set(), // userIds already warned for deleting a link this session
       closingMessage: null,
       closeAt: null, // epoch ms when the submission window locks
+      startedAt: Date.now(),
+      noticeAt: new Map(), // userId -> last time a rejection notice was posted
       engagementLabel: null,
       timers: [],
     };
@@ -891,6 +1110,10 @@ async function handleDeletedLink(messageId, { bulk = false } = {}) {
 
     const outcome = await applyWarning(defaultersChannel.guild, entry.userId);
 
+    if (outcome.timedOutUntil) {
+      await recordTimeoutBan(entry.userId, entry.handle, outcome.timedOutUntil);
+    }
+
     await defaultersChannel.send({
       content: buildDeletedLinkMessage(entry.userId, outcome.label),
       allowedMentions: { users: [entry.userId] },
@@ -1067,7 +1290,8 @@ async function remindDefaulters(defaulterIds, channelId) {
 
 /**
  * Applies one step of escalation to a single member and returns
- * { userId, label } where label is 'Warning 1' | 'Warning 2' | '7 Day Timeout'.
+ * { userId, label, timedOutUntil } where label is 'Warning 1' | 'Warning 2' | '7 Day Timeout'
+ * (timedOutUntil: epoch ms, only for a 7-day timeout Discord actually accepted).
  *   no warning role -> Warning 1
  *   has Warning 1   -> remove Warning 1, add Warning 2
  *   has Warning 2   -> 7-day timeout (Warning 2 is kept, not removed)
@@ -1083,10 +1307,16 @@ async function applyWarning(guild, userId) {
   const hasWarning2 = member.roles.cache.has(WARNING_ROLE_2_ID);
 
   if (hasWarning2) {
-    await member
-      .timeout(WARNING_2_TIMEOUT_MS, 'Repeated raid violation')
-      .catch((err) => console.error(`[warnings] Timeout failed for ${userId}:`, err));
-    return { userId, label: '7 Day Timeout' };
+    // timedOutUntil is only set if Discord accepted the timeout (it can fail for admins etc.)
+    let timedOutUntil = null;
+    try {
+      const updated = await member.timeout(WARNING_2_TIMEOUT_MS, 'Repeated raid violation');
+      timedOutUntil =
+        (updated && updated.communicationDisabledUntilTimestamp) || Date.now() + WARNING_2_TIMEOUT_MS;
+    } catch (err) {
+      console.error(`[warnings] Timeout failed for ${userId}:`, err);
+    }
+    return { userId, label: '7 Day Timeout', timedOutUntil };
   }
 
   if (hasWarning1) {
@@ -1100,12 +1330,19 @@ async function applyWarning(guild, userId) {
 }
 
 /** Escalates every engagement defaulter; returns outcomes for the announcement. */
-async function assignWarningRoles(defaulterIds, guild) {
+async function assignWarningRoles(defaulterIds, guild, session) {
   const outcomes = [];
 
   for (const userId of defaulterIds) {
     try {
-      outcomes.push(await applyWarning(guild, userId));
+      const outcome = await applyWarning(guild, userId);
+      outcomes.push(outcome);
+
+      // 7-day timeout -> block that member's X handle so an alt account can't replace them.
+      if (outcome.timedOutUntil) {
+        const participant = session && session.participants.get(userId);
+        await recordTimeoutBan(userId, participant && participant.handle, outcome.timedOutUntil);
+      }
     } catch (err) {
       console.error(`[warnings] Failed to process defaulter ${userId}:`, err);
     }
@@ -1155,7 +1392,7 @@ async function runFinalCheck(session) {
 
   try {
     const channel = await client.channels.fetch(DEFAULTERS_CHANNEL_ID);
-    const outcomes = await assignWarningRoles(defaulterIds, channel.guild);
+    const outcomes = await assignWarningRoles(defaulterIds, channel.guild, session);
 
     if (outcomes.length > 0) {
       await channel.send({
@@ -1184,6 +1421,205 @@ function endSession(session) {
     sessions.delete(session.channelId);
   }
   console.log(`[endSession] (${session.label}) Session state cleared.`);
+}
+
+// ----------------------------------------------------------------------------
+// Timeout expiry cleanup (warning roles + banned X handles)
+// ----------------------------------------------------------------------------
+// There is no setTimeout per timeout: Discord ends the timeout itself, and this
+// hourly sweep (plus !checkTimeouts) then resets the member's roles and ban.
+//
+// Warning 2 on its own is NOT a timeout (it is the warning before one), so a member
+// is only released when a timeout has really ended:
+//   - Discord's communicationDisabledUntil is in the past, or
+//   - Discord shows nothing but our own saved timeoutUntil has passed (Discord can
+//     clear the field after expiry, which would otherwise look like "never timed out").
+
+/** IDs of members holding a role, via REST pages (not cached, so it can't bloat memory). */
+async function listMemberIdsWithRole(guild, roleId) {
+  const ids = [];
+  try {
+    let after;
+    for (let page = 0; page < 50; page++) {
+      const batch = await guild.members.list({ limit: 1000, after, cache: false });
+      for (const member of batch.values()) {
+        if (member.roles.cache.has(roleId)) ids.push(member.id);
+      }
+      if (batch.size < 1000) break;
+      after = batch.lastKey();
+    }
+  } catch (err) {
+    if (!memberListWarned) {
+      memberListWarned = true;
+      console.warn(
+        '[cleanup] Could not list server members (is the "Server Members Intent" enabled for the bot in the Developer Portal?) — checking the banned list only.',
+        err && err.message
+      );
+    }
+  }
+  return ids;
+}
+
+/** Releases one member if their timeout has ended. */
+async function releaseIfTimeoutExpired(guild, userId) {
+  const now = Date.now();
+  const entry = bannedHandles.find((e) => e.discordId === userId) || null;
+
+  let member = null;
+  try {
+    member = await guild.members.fetch({ user: userId, force: true });
+  } catch (err) {
+    if (!(err && err.code === 10007)) throw err; // 10007 = Unknown Member (left the server)
+  }
+
+  if (!member) {
+    // Left the server: drop the ban only once our own record says the timeout is over.
+    if (entry && entry.timeoutUntil && entry.timeoutUntil <= now) {
+      await removeBannedHandle(userId);
+      console.log(`[cleanup] ${userId} left the server and their timeout ended — handle @${entry.xHandle} released.`);
+      return { released: false, handleRemoved: true };
+    }
+    return { released: false, handleRemoved: false };
+  }
+
+  const discordUntil = member.communicationDisabledUntilTimestamp;
+  const until =
+    discordUntil != null ? discordUntil : entry && entry.timeoutUntil ? entry.timeoutUntil : null;
+
+  if (until === null || until > now) return { released: false, handleRemoved: false };
+
+  const rolesToRemove = [WARNING_ROLE_1_ID, WARNING_ROLE_2_ID].filter((id) =>
+    member.roles.cache.has(id)
+  );
+  if (rolesToRemove.length > 0) {
+    await member.roles.remove(rolesToRemove, 'Timeout ended — warnings reset');
+  }
+  const removed = await removeBannedHandle(userId);
+
+  console.log(
+    `[cleanup] ${userId}: timeout ended — removed ${rolesToRemove.length} warning role(s)${removed.length ? ` and released @${removed.map((e) => e.xHandle).join(', @')}` : ''}.`
+  );
+  return { released: rolesToRemove.length > 0, handleRemoved: removed.length > 0 };
+}
+
+/**
+ * Finds members whose 7-day timeout has ended and resets them. Runs on startup,
+ * hourly, and on !checkTimeouts. Returns a summary (null if already running).
+ */
+async function cleanupExpiredTimeouts() {
+  if (cleanupRunning) return null;
+  cleanupRunning = true;
+
+  const summary = { checked: 0, released: 0, handlesRemoved: 0, errors: 0 };
+  try {
+    const channel = await client.channels.fetch(DEFAULTERS_CHANNEL_ID);
+    const guild = channel.guild;
+
+    // Members holding Warning 2 + everyone on the banned list.
+    const candidates = new Set(bannedHandles.map((e) => e.discordId));
+    for (const id of await listMemberIdsWithRole(guild, WARNING_ROLE_2_ID)) candidates.add(id);
+
+    for (const userId of candidates) {
+      summary.checked++;
+      try {
+        const result = await releaseIfTimeoutExpired(guild, userId);
+        if (result.released) summary.released++;
+        if (result.handleRemoved) summary.handlesRemoved++;
+      } catch (err) {
+        summary.errors++;
+        console.error(`[cleanup] Failed to process ${userId}:`, err);
+      }
+    }
+
+    console.log(
+      `[cleanup] Checked ${summary.checked} member(s): ${summary.released} released, ${summary.handlesRemoved} handle(s) removed, ${summary.errors} error(s).`
+    );
+  } catch (err) {
+    summary.errors++;
+    console.error('[cleanup] Timeout cleanup failed:', err);
+  } finally {
+    cleanupRunning = false;
+  }
+  return summary;
+}
+
+// ----------------------------------------------------------------------------
+// Owner-only commands: !banx, !unbanx, !checkTimeouts
+// ----------------------------------------------------------------------------
+
+const OWNER_COMMANDS = new Set(['!banx', '!unbanx', '!checktimeouts']);
+
+/** Returns true if the message was one of these commands (handled or silently ignored). */
+async function handleOwnerCommand(message) {
+  const parts = (message.content || '').trim().split(/\s+/);
+  const command = (parts[0] || '').toLowerCase();
+  if (!OWNER_COMMANDS.has(command)) return false;
+  if (!OWNER_USER_IDS.has(message.author.id)) return true; // not the owner: ignored, no reply
+
+  const reply = (text) =>
+    message
+      .reply({ content: text, allowedMentions: { parse: [], repliedUser: false } })
+      .catch((err) => console.error('[command] Could not reply:', err));
+
+  try {
+    if (command === '!checktimeouts') {
+      const summary = await cleanupExpiredTimeouts();
+      if (!summary) {
+        await reply('⏳ A timeout cleanup is already running — try again in a moment.');
+      } else {
+        await reply(
+          `✅ Timeout cleanup done — checked ${summary.checked}, released ${summary.released}, handles removed ${summary.handlesRemoved}, errors ${summary.errors}.`
+        );
+      }
+      return true;
+    }
+
+    if (command === '!banx') {
+      const discordId = parts[1];
+      const xHandle = (parts[2] || '').replace(/^@/, '');
+      if (!/^\d{17,20}$/.test(discordId || '') || !/^[A-Za-z0-9_]{1,15}$/.test(xHandle)) {
+        await reply('Usage: `!banx <discord_id> <x_handle>` — e.g. `!banx 123456789012345678 xYoungOldmanx`');
+        return true;
+      }
+
+      // If they are timed out right now, remember when it ends so the ban lifts on its own.
+      let timeoutUntil = null;
+      try {
+        const member = await message.guild.members.fetch({ user: discordId, force: true });
+        const until = member.communicationDisabledUntilTimestamp;
+        if (until && until > Date.now()) timeoutUntil = until;
+      } catch (err) {
+        /* not in the server — still ban the handle */
+      }
+
+      await addBannedHandle(discordId, xHandle, timeoutUntil);
+      await reply(
+        timeoutUntil
+          ? `✅ Banned X handle \`@${xHandle}\` for \`${discordId}\`. It lifts automatically when their timeout ends (<t:${Math.floor(timeoutUntil / 1000)}:F>).`
+          : `✅ Banned X handle \`@${xHandle}\` for \`${discordId}\`. ⚠️ That member isn't timed out in Discord right now, so this ban will NOT lift by itself — use \`!unbanx ${discordId}\` to remove it.`
+      );
+      return true;
+    }
+
+    if (command === '!unbanx') {
+      const discordId = parts[1];
+      if (!/^\d{1,25}$/.test(discordId || '')) {
+        await reply('Usage: `!unbanx <discord_id>`');
+        return true;
+      }
+      const removed = await removeBannedHandle(discordId);
+      await reply(
+        removed.length
+          ? `✅ Removed ${removed.map((e) => `\`@${e.xHandle}\``).join(', ')} for \`${discordId}\` from the banned list.`
+          : `Nothing to remove — \`${discordId}\` is not on the banned list.`
+      );
+      return true;
+    }
+  } catch (err) {
+    console.error(`[command] ${command} failed:`, err);
+    await reply('❌ Something went wrong — check the console.');
+  }
+  return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -1396,6 +1832,8 @@ async function verifyEmojis(guild) {
     buildSoftReminderMessage([]),
     buildFinalWarningMessage('Morning', []),
     buildGuideMessage('x'),
+    buildWrongLinkMessage('1'),
+    buildBannedAltMessage('1'),
   ].join('\n');
 
   const found = new Map();
@@ -1517,6 +1955,12 @@ client.once(Events.ClientReady, () => {
   scheduleRaidSessions(); // first, so setup problems can never block the schedule
   setupDefaultersChannelPermissions();
   runStartupChecks();
+
+  // Release members whose 7-day timeout has ended: now, then every hour.
+  cleanupExpiredTimeouts().catch((err) => console.error('[cleanup] Startup run failed:', err));
+  setInterval(() => {
+    cleanupExpiredTimeouts().catch((err) => console.error('[cleanup] Hourly run failed:', err));
+  }, TIMEOUT_CLEANUP_INTERVAL_MS);
 });
 
 if (!DISCORD_TOKEN) {
@@ -1525,6 +1969,7 @@ if (!DISCORD_TOKEN) {
 }
 
 logSystemInfo();
+loadBannedHandles();
 
 // ----------------------------------------------------------------------------
 // Keep-alive / health HTTP server (Docker / Kerit Cloud)
@@ -1538,9 +1983,9 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
 
 const server = http.createServer((req, res) => {
-  const path = String(req.url || '/').split('?')[0];
+  const urlPath = String(req.url || '/').split('?')[0];
 
-  if (path === '/health') {
+  if (urlPath === '/health') {
     const ready = client.isReady();
     res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
     res.end(
